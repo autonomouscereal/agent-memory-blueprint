@@ -87,7 +87,9 @@ Hooks should be best-effort. Memory failure must not break the agent harness. Th
 
 ## Sources And Design Anchors
 
-- OpenAI Agents SDK sessions define memory/session boundaries and custom session storage.
-- OpenAI sandbox memory describes progressive disclosure and editable local memory notes.
-- pgvector documents hybrid use with PostgreSQL full-text search.
-- Current agent memory research increasingly separates state, episodic recall, and lifecycle handling rather than relying only on vector similarity.
+- OpenAI Agents SDK sessions: https://openai.github.io/openai-agents-python/sessions/
+- pgvector: https://github.com/pgvector/pgvector
+- PostgreSQL full-text search: https://www.postgresql.org/docs/current/textsearch.html
+- LangGraph memory concepts: https://docs.langchain.com/oss/python/langgraph/memory
+
+Current agent memory patterns increasingly separate session state, scoped episodic recall, and lifecycle handling rather than relying only on vector similarity.
