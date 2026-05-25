@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+logs/
+exports/
+*.dump
+*.sql.gz
+.DS_Store
+Thumbs.db

@@ -1,0 +1,11 @@
+{
+  "UserPromptSubmit": {
+    "command": "python /path/to/agent-memory-blueprint/src/agent_memory.py hook --event-type UserPromptSubmit --agent Codex --source codex_hook"
+  },
+  "PostToolUse": {
+    "command": "python /path/to/agent-memory-blueprint/src/agent_memory.py hook --event-type PostToolUse --agent Codex --source codex_hook"
+  },
+  "Stop": {
+    "command": "python /path/to/agent-memory-blueprint/src/agent_memory.py hook --event-type Stop --agent Codex --source codex_hook"
+  }
+}

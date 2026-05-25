@@ -1,0 +1,17 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: agent-memory-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${MEMORY_DB_NAME:-agent_memory}
+      POSTGRES_USER: ${MEMORY_DB_USER:-agent_memory}
+      POSTGRES_PASSWORD: ${MEMORY_DB_PASSWORD:?set MEMORY_DB_PASSWORD in .env}
+    ports:
+      - "${MEMORY_DB_PORT:-25490}:5432"
+    volumes:
+      - agent_memory_pgdata:/var/lib/postgresql/data
+      - ./schema:/docker-entrypoint-initdb.d:ro
+
+volumes:
+  agent_memory_pgdata:

@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /path/to/agent-memory-blueprint/src/agent_memory.py hook --event-type UserPromptSubmit --agent ClaudeCode --source claude_hook"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /path/to/agent-memory-blueprint/src/agent_memory.py hook --event-type PostToolUse --agent ClaudeCode --source claude_hook"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /path/to/agent-memory-blueprint/src/agent_memory.py hook --event-type Stop --agent ClaudeCode --source claude_hook"
+          }
+        ]
+      }
+    ]
+  }
+}
