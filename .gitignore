@@ -1,12 +1,42 @@
+# Allowlist. This folder can also be a live install, sitting next to private
+# notes, logs, spooled hook payloads and evidence files. Ignore everything and
+# opt files in one at a time, so nothing private gets swept into a commit.
+*
+
+!.gitignore
+!.gitattributes
+!.env.example
+!README.md
+!requirements.txt
+!docker-compose.yml
+
+!agent_memory.py
+!agent_memory_hook.py
+!agent_identity.py
+!identity_history.py
+!codex_transcript_import.py
+!start.py
+!test_agent_identity.py
+!test_identity_postgres.py
+
+!docs/
+!docs/*.md
+!hooks/
+!hooks/*.example.json
+!schema/
+!schema/*.sql
+!skills/
+!skills/agent-memory-blueprint/
+!skills/agent-memory-blueprint/SKILL.md
+
+# Belt and braces: never these, even if someone adds an allow rule above.
 .env
 .env.*
 !.env.example
-.venv/
+logs/
 __pycache__/
 *.pyc
-logs/
-exports/
+*.jsonl
+*.zlib
 *.dump
 *.sql.gz
-.DS_Store
-Thumbs.db

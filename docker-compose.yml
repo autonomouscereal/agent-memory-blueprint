@@ -7,11 +7,17 @@ services:
       POSTGRES_DB: ${MEMORY_DB_NAME:-agent_memory}
       POSTGRES_USER: ${MEMORY_DB_USER:-agent_memory}
       POSTGRES_PASSWORD: ${MEMORY_DB_PASSWORD:?set MEMORY_DB_PASSWORD in .env}
+    # Loopback only. To share one memory database across machines, change this
+    # to "${MEMORY_DB_PORT:-25490}:5432" and firewall it to your own hosts.
     ports:
-      - "${MEMORY_DB_PORT:-25490}:5432"
+      - "127.0.0.1:${MEMORY_DB_PORT:-25490}:5432"
     volumes:
       - agent_memory_pgdata:/var/lib/postgresql/data
-      - ./schema:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
 volumes:
   agent_memory_pgdata:

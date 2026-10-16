@@ -2,11 +2,11 @@
   "hooks": {
     "UserPromptSubmit": [
       {
-        "matcher": ".*",
         "hooks": [
           {
             "type": "command",
-            "command": "python /path/to/agent-memory-blueprint/src/agent_memory.py hook --event-type UserPromptSubmit --agent ClaudeCode --source claude_hook"
+            "command": "python /path/to/agent-memory-blueprint/agent_memory_hook.py --event UserPromptSubmit --agent ClaudeCode --source claude_hook",
+            "statusMessage": "Filing prompt into memory..."
           }
         ]
       }
@@ -17,18 +17,64 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python /path/to/agent-memory-blueprint/src/agent_memory.py hook --event-type PostToolUse --agent ClaudeCode --source claude_hook"
+            "command": "python /path/to/agent-memory-blueprint/agent_memory_hook.py --event PostToolUse --agent ClaudeCode --source claude_hook",
+            "statusMessage": "Filing tool call into memory..."
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /path/to/agent-memory-blueprint/agent_memory_hook.py --event PostToolUseFailure --agent ClaudeCode --source claude_hook",
+            "statusMessage": "Filing failed tool call into memory..."
           }
         ]
       }
     ],
     "Stop": [
       {
-        "matcher": ".*",
         "hooks": [
           {
             "type": "command",
-            "command": "python /path/to/agent-memory-blueprint/src/agent_memory.py hook --event-type Stop --agent ClaudeCode --source claude_hook"
+            "command": "python /path/to/agent-memory-blueprint/agent_memory_hook.py --event Stop --agent ClaudeCode --source claude_hook",
+            "statusMessage": "Finalizing memory for this turn..."
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /path/to/agent-memory-blueprint/agent_memory_hook.py --event StopFailure --agent ClaudeCode --source claude_hook",
+            "statusMessage": "Recording failed turn in memory..."
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /path/to/agent-memory-blueprint/agent_memory_hook.py --event PreCompact --agent ClaudeCode --source claude_hook",
+            "statusMessage": "Recording compaction boundary in memory..."
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /path/to/agent-memory-blueprint/agent_memory_hook.py --event SessionEnd --agent ClaudeCode --source claude_hook",
+            "statusMessage": "Finalizing session in memory...",
+            "timeout": 10
           }
         ]
       }

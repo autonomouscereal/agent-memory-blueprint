@@ -1,1 +1,6 @@
-psycopg2-binary==2.9.10
+asyncpg>=0.30.0,<1.0
+# Optional extractors for ingest-file / ingest-path. Missing ones are skipped
+# with a warning; hooks, search and the rest of the CLI do not need them.
+openpyxl>=3.1.5,<4.0
+pillow>=11.0.0,<13.0
+pypdf>=5.0.0,<7.0
