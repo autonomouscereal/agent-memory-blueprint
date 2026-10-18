@@ -86,10 +86,22 @@ python agent_memory.py --json audit --agent ClaudeCode --limit 20               
 python agent_memory.py --json audit --model-id claude-opus-5-5 --limit 20                 # by model
 python agent_memory.py spaces
 python agent_memory.py --json status
+python agent_memory.py --json status --details       # exact accounting; scans the corpus
 python agent_memory.py ingest-path ./docs --recursive --space workspace/my-api --tags docs
 python agent_memory_hook.py --pending-status          # hooks waiting to be replayed
 python agent_memory_hook.py --replay-pending
 ```
+
+Default `status` uses PostgreSQL statistics for event, space, graph, and archive
+counts (`count_accuracy: estimated`). These estimates can lag recent writes.
+After a statistics reset, counts fall back to the catalog estimate; counts
+without a maintained baseline or catalog estimate are `null` (unknown).
+Oldest/newest timestamps use bounded index lookups, and cache
+counters remain exact. `top_spaces` is empty and archive character/byte totals
+are `null`, explicitly listed in `omitted_fields`; they are not zero. Each query
+has a five-second statement timeout. `status --details` computes exact counts,
+archive totals, top spaces, and all breakdown rows with a two-minute timeout per
+query. Use detailed accounting deliberately, rather than as a liveness probe.
 
 `relate`, `entities` and `graph` maintain a small entity graph for explicit
 notes. `backfill-identities`, `ingest-codex-transcript` and `ingest-error-log`
