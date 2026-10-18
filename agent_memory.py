@@ -3007,8 +3007,64 @@ def print_result(data: Any, as_json: bool = False) -> None:
     print(json.dumps(data, indent=2, ensure_ascii=False, default=json_default))
 
 
+async def self_test_schema_async() -> dict[str, Any]:
+    """Inspect schema without acquiring DDL locks on live memory tables."""
+    required = {
+        "agent_memory_spaces": "space description parent_space metadata created_at updated_at",
+        "agent_memory_events": "id event_uid created_at space session_id agent event_type memory_kind role source content summary tags metadata embedding search_vector",
+        "agent_memory_entities": "id space name kind summary metadata created_at updated_at",
+        "agent_memory_entity_mentions": "event_id entity_id weight created_at",
+        "agent_memory_entity_edges": "id space source_entity_id target_entity_id relation description metadata created_at updated_at",
+        "agent_memory_event_links": "id source_event_id target_event_id link_type description metadata created_at",
+        "agent_memory_payload_archives": "id event_id event_uid payload_sha256 payload_kind payload_format compression raw_chars compressed_bytes redacted space session_id agent event_type source payload metadata created_at",
+        "agent_memory_search_state": "singleton revision mutation_revision updated_at",
+        "agent_memory_search_cache": "cache_key revision mutation_revision max_event_id results result_count hit_count created_at refreshed_at last_accessed_at",
+    }
+    conn = await connect()
+    try:
+        await conn.execute("SELECT set_config('statement_timeout', $1, false)", "5000", timeout=5)
+        rows = await conn.fetch(
+            """
+            SELECT c.relname, a.attname
+            FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+            WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+              AND c.relname = ANY($1::text[])
+              AND a.attnum > 0 AND NOT a.attisdropped
+            """,
+            list(required), timeout=5,
+        )
+        extensions = await conn.fetch(
+            "SELECT extname FROM pg_catalog.pg_extension WHERE extname = ANY($1::text[])",
+            ["vector", "pg_trgm"], timeout=5,
+        )
+    finally:
+        await conn.close(timeout=5)
+    columns: dict[str, set[str]] = {}
+    for row in rows:
+        columns.setdefault(row["relname"], set()).add(row["attname"])
+    missing = []
+    for table, names in required.items():
+        if table not in columns:
+            missing.append(table)
+        else:
+            missing.extend(table + "." + name for name in names.split() if name not in columns[table])
+    available_extensions = {row["extname"] for row in extensions}
+    missing.extend("extension:" + name for name in ("vector", "pg_trgm") if name not in available_extensions)
+    if missing:
+        return {
+            "ok": False,
+            "error": "Memory schema is missing or outdated. Run python agent_memory.py init explicitly when schema maintenance is safe, then retry self-test.",
+            "missing_schema": missing,
+        }
+    return {"ok": True}
+
+
 async def self_test_async() -> dict[str, Any]:
-    await init_db_async()
+    schema = await self_test_schema_async()
+    if not schema["ok"]:
+        return schema
     sentinel = "AGENT_MEMORY_SELF_TEST_20260512 asyncpg cpu embedder postgres semantic audit trace"
     space_a = "self-test-alpha"
     space_b = "self-test-beta"
@@ -3064,7 +3120,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init", help="Initialize schema")
     status_parser = sub.add_parser("status", help="Show bounded memory status")
     status_parser.add_argument("--details", action="store_true", help="Compute exact counts, archive sizes, and all space/agent breakdowns (may be slow)")
-    sub.add_parser("self-test", help="Run an insert/search test")
+    sub.add_parser("self-test", help="Test inserts/search/isolation on an initialized schema (no DDL)")
 
     add = sub.add_parser("add", help="Add a memory event")
     add.add_argument("--agent", default=os.getenv("AGENT_MEMORY_AGENT", "agent"))
