@@ -2644,37 +2644,83 @@ async def audit_events_async(
 async def status_async(*, details: bool = False) -> dict[str, Any]:
     conn = await connect()
     try:
-        total = await conn.fetchval("SELECT count(*) AS total FROM agent_memory_events")
-        space_count = await conn.fetchval("SELECT count(*) FROM agent_memory_spaces")
-        top_space_rows = await conn.fetch(
-            """
-            SELECT space, count(*) AS events
-            FROM agent_memory_events
-            GROUP BY space
-            ORDER BY count(*) DESC, space
-            LIMIT 20
-            """
-        )
-        graph_counts = await conn.fetchrow(
-            """
-            SELECT
-                (SELECT count(*) FROM agent_memory_entities) AS entities,
-                (SELECT count(*) FROM agent_memory_entity_edges) AS entity_edges,
-                (SELECT count(*) FROM agent_memory_event_links) AS event_links,
-                (SELECT count(*) FROM agent_memory_payload_archives) AS payload_archives,
-                (SELECT COALESCE(sum(raw_chars), 0) FROM agent_memory_payload_archives) AS payload_archive_raw_chars,
-                (SELECT COALESCE(sum(compressed_bytes), 0) FROM agent_memory_payload_archives) AS payload_archive_compressed_bytes
-            """
-        )
+        # Health checks must not scan the event/archive corpus. Detailed
+        # accounting is explicitly requested and has a finite query budget too.
+        query_timeout_ms = 120000 if details else 5000
+        await conn.execute("SELECT set_config('statement_timeout', $1, false)", str(query_timeout_ms))
+        if details:
+            total = await conn.fetchval("SELECT count(*) AS total FROM agent_memory_events")
+            space_count = await conn.fetchval("SELECT count(*) FROM agent_memory_spaces")
+            top_space_rows = await conn.fetch(
+                """
+                SELECT space, count(*) AS events
+                FROM agent_memory_events
+                GROUP BY space
+                ORDER BY count(*) DESC, space
+                LIMIT 20
+                """
+            )
+            graph_counts = await conn.fetchrow(
+                """
+                SELECT
+                    (SELECT count(*) FROM agent_memory_entities) AS entities,
+                    (SELECT count(*) FROM agent_memory_entity_edges) AS entity_edges,
+                    (SELECT count(*) FROM agent_memory_event_links) AS event_links,
+                    (SELECT count(*) FROM agent_memory_payload_archives) AS payload_archives,
+                    (SELECT COALESCE(sum(raw_chars), 0) FROM agent_memory_payload_archives) AS payload_archive_raw_chars,
+                    (SELECT COALESCE(sum(compressed_bytes), 0) FROM agent_memory_payload_archives) AS payload_archive_compressed_bytes
+                """
+            )
+        else:
+            statistics = await conn.fetch(
+                """
+                SELECT s.relname, s.n_live_tup, c.reltuples,
+                       s.last_analyze, s.last_autoanalyze, s.last_vacuum, s.last_autovacuum
+                FROM pg_stat_user_tables s
+                JOIN pg_class c ON c.oid = s.relid
+                WHERE s.schemaname = 'public' AND s.relname = ANY($1::text[])
+                """,
+                [
+                    "agent_memory_events", "agent_memory_spaces", "agent_memory_entities",
+                    "agent_memory_entity_edges", "agent_memory_event_links", "agent_memory_payload_archives",
+                ],
+            )
+            estimates = {}
+            for row in statistics:
+                # After a statistics reset, n_live_tup can reflect only a few
+                # new inserts. Prefer the persisted catalog estimate until
+                # ANALYZE/VACUUM has established a fresh baseline.
+                maintained = any(row[key] for key in (
+                    "last_analyze", "last_autoanalyze", "last_vacuum", "last_autovacuum",
+                ))
+                estimates[row["relname"]] = (
+                    row["n_live_tup"] if maintained
+                    else int(row["reltuples"]) if row["reltuples"] >= 0 else None
+                )
+            total = estimates.get("agent_memory_events")
+            space_count = estimates.get("agent_memory_spaces")
+            top_space_rows = []
+            graph_counts = {
+                key: estimates.get("agent_memory_" + key)
+                for key in ("entities", "entity_edges", "event_links", "payload_archives")
+            }
+            graph_counts.update(payload_archive_raw_chars=None, payload_archive_compressed_bytes=None)
         span = await conn.fetchrow(
             """
-            SELECT max(created_at) AS newest, min(created_at) AS oldest
-            FROM agent_memory_events
+            SELECT
+                (SELECT created_at FROM agent_memory_events ORDER BY created_at DESC LIMIT 1) AS newest,
+                (SELECT created_at FROM agent_memory_events ORDER BY created_at ASC LIMIT 1) AS oldest
             """
         )
         result = {
             "ok": True,
             "driver": "asyncpg",
+            "count_accuracy": "exact" if details else "estimated",
+            "count_source": "queries" if details else "pg_stat_user_tables.n_live_tup or pg_class.reltuples",
+            "query_timeout_ms": query_timeout_ms,
+            "omitted_fields": [] if details else [
+                "top_spaces", "graph.payload_archive_raw_chars", "graph.payload_archive_compressed_bytes",
+            ],
             "total": total,
             "span": dict(span) if span else {},
             "space_count": space_count,
@@ -3017,7 +3063,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("init", help="Initialize schema")
     status_parser = sub.add_parser("status", help="Show bounded memory status")
-    status_parser.add_argument("--details", action="store_true", help="Include every space and agent/event breakdown row")
+    status_parser.add_argument("--details", action="store_true", help="Compute exact counts, archive sizes, and all space/agent breakdowns (may be slow)")
     sub.add_parser("self-test", help="Run an insert/search test")
 
     add = sub.add_parser("add", help="Add a memory event")
