@@ -19,6 +19,7 @@
 !test_agent_identity.py
 !test_identity_postgres.py
 !test_status.py
+!test_self_test.py
 
 !docs/
 !docs/*.md

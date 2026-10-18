@@ -103,6 +103,13 @@ has a five-second statement timeout. `status --details` computes exact counts,
 archive totals, top spaces, and all breakdown rows with a two-minute timeout per
 query. Use detailed accounting deliberately, rather than as a liveness probe.
 
+`self-test` checks the initialized schema through bounded catalog reads, then
+runs its insert, search, isolation, and graph checks. It never runs schema DDL.
+If the schema is missing or outdated it exits unsuccessfully with the missing
+objects and explicit `python agent_memory.py init` guidance. Run `init` separately
+when schema maintenance is safe: even idempotent `ALTER TABLE` can wait behind
+a long reader and block subsequent memory writes.
+
 `relate`, `entities` and `graph` maintain a small entity graph for explicit
 notes. `backfill-identities`, `ingest-codex-transcript` and `ingest-error-log`
 are recovery tools; [docs/architecture.md](docs/architecture.md) covers them.
