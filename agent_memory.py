@@ -194,18 +194,27 @@ def write_error_log(exc: Exception) -> None:
 
 async def connect() -> asyncpg.Connection:
     conn = await asyncpg.connect(**db_config())
-    await conn.set_type_codec(
-        "jsonb",
-        encoder=lambda value: json.dumps(value, ensure_ascii=False, default=json_default),
-        decoder=json.loads,
-        schema="pg_catalog",
-    )
-    await conn.set_type_codec(
-        "json",
-        encoder=lambda value: json.dumps(value, ensure_ascii=False, default=json_default),
-        decoder=json.loads,
-        schema="pg_catalog",
-    )
+    try:
+        await conn.set_type_codec(
+            "jsonb",
+            encoder=lambda value: json.dumps(value, ensure_ascii=False, default=json_default),
+            decoder=json.loads,
+            schema="pg_catalog",
+        )
+        await conn.set_type_codec(
+            "json",
+            encoder=lambda value: json.dumps(value, ensure_ascii=False, default=json_default),
+            decoder=json.loads,
+            schema="pg_catalog",
+        )
+    except BaseException:
+        # Ownership has not reached the caller yet, including when its connect
+        # timeout cancels codec setup. Do not leave that connection behind.
+        try:
+            conn.terminate()
+        except Exception:
+            pass  # Preserve the setup error or cancellation.
+        raise
     return conn
 
 

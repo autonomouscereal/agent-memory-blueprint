@@ -90,6 +90,7 @@ HOOK_CONNECT_TIMEOUT = max(1.0, min(float(os.getenv("AGENT_MEMORY_HOOK_CONNECT_T
 HOOK_STATEMENT_TIMEOUT_MS = max(1000, min(int(os.getenv("AGENT_MEMORY_HOOK_STATEMENT_TIMEOUT_MS", "15000")), 60000))
 HOOK_LOCK_TIMEOUT_MS = max(500, min(int(os.getenv("AGENT_MEMORY_HOOK_LOCK_TIMEOUT_MS", "3000")), 30000))
 HOOK_REPLAY_LIMIT = max(0, min(int(os.getenv("AGENT_MEMORY_HOOK_REPLAY_LIMIT", "1")), 20))
+HOOK_CLOSE_TIMEOUT = 1.0
 
 
 def audit_safe_text(text: str, limit: int | None = 4000) -> str:
@@ -478,6 +479,19 @@ async def connect_for_hook():
     raise last_error
 
 
+async def close_for_hook(conn) -> None:
+    # asyncpg may wait for query cancellation before its own close timeout
+    # starts. Bound the entire close, then synchronously release our connection.
+    try:
+        await asyncio.wait_for(conn.close(timeout=HOOK_CLOSE_TIMEOUT), timeout=HOOK_CLOSE_TIMEOUT)
+    except BaseException:
+        try:
+            conn.terminate()
+        except Exception:
+            pass  # Cleanup must not replace the failure that triggered it.
+        raise
+
+
 async def store_hook_record(record: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     event = record["event"]
     archive = record["archive"]
@@ -519,7 +533,17 @@ async def store_hook_record(record: dict[str, Any]) -> tuple[dict[str, Any], dic
             )
         return result, archive_result
     finally:
-        await conn.close()
+        operation_error = sys.exception()
+        try:
+            await close_for_hook(conn)
+        except BaseException as close_error:
+            # Keep the original write failure/cancellation. A new cancellation
+            # during cleanup must still propagate to the caller.
+            if operation_error is None or (
+                isinstance(close_error, asyncio.CancelledError)
+                and not isinstance(operation_error, asyncio.CancelledError)
+            ):
+                raise
 
 
 async def replay_pending_async(limit: int = 100) -> dict[str, Any]:
