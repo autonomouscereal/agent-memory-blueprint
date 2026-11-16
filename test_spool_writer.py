@@ -114,5 +114,21 @@ class SpoolWriterEquivalence(unittest.TestCase):
         self.assertLess(elapsed, 10.0)
 
 
+    def test_health_flags_missing_writer_and_old_inbox(self) -> None:
+        scratch = Path(tempfile.mkdtemp(prefix="spool-health-"))
+        copy = scratch / "agent_memory_spool_hook.py"
+        copy.write_bytes(SPOOL_HOOK.read_bytes())
+        inbox = scratch / "logs" / "inbox"
+        inbox.mkdir(parents=True)
+        old_ns = time.time_ns() - 600 * 10**9
+        (inbox / f"{old_ns:020d}-1-abcd.hook").write_bytes(b"{}\n")
+        out = subprocess.run([sys.executable, "-I", "-S", str(copy), "--health"], capture_output=True)
+        report = json.loads(out.stdout)
+        self.assertEqual(out.returncode, 3)
+        self.assertIn("writer_not_running", report["reasons"])
+        self.assertIn("inbox_event_older_than_300s", report["reasons"])
+        self.assertEqual(report["inbox_waiting"], 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

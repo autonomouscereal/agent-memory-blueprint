@@ -217,9 +217,58 @@ def ensure_writer():
     spawn_writer()
 
 
+def health(max_heartbeat_s=60.0, max_inbox_age_s=300.0):
+    """Exit 0 when the writer is alive and nothing waits too long; 3 otherwise.
+
+    Prints one JSON line for a watchdog: writer pid and heartbeat age, inbox
+    count and oldest age, files set aside, and the reasons it is unhealthy.
+    """
+    now_ns = time.time_ns()
+    pid, age = heartbeat()
+    waiting, oldest = 0, 0.0
+    try:
+        for name in os.listdir(INBOX_DIR):
+            if name.endswith(".hook"):
+                waiting += 1
+                try:
+                    oldest = max(oldest, (now_ns - int(name.split("-", 1)[0])) / 1e9)
+                except ValueError:
+                    pass
+    except FileNotFoundError:
+        pass
+    bad_dir = os.path.join(INBOX_DIR, "bad")
+    bad = len([n for n in os.listdir(bad_dir) if n.endswith(".hook")]) if os.path.isdir(bad_dir) else 0
+    pending_dir = os.path.join(SPOOL_ROOT, "pending")
+    pending = len([n for n in os.listdir(pending_dir) if n.endswith(".pending.zlib")]) if os.path.isdir(pending_dir) else 0
+    reasons = []
+    if not writer_running():
+        reasons.append("writer_not_running")
+    elif age > max_heartbeat_s:
+        reasons.append("writer_heartbeat_stale")
+    if oldest > max_inbox_age_s:
+        reasons.append("inbox_event_older_than_%ds" % int(max_inbox_age_s))
+    if bad:
+        reasons.append("inbox_bad_files")
+    report = {
+        "healthy": not reasons,
+        "reasons": reasons,
+        "writer_pid": pid or None,
+        "writer_heartbeat_age_s": None if age == float("inf") else round(age, 1),
+        "inbox_waiting": waiting,
+        "inbox_oldest_age_s": round(oldest, 1),
+        "inbox_bad": bad,
+        "pending": pending,
+        "checked_at_ns": now_ns,
+    }
+    sys.stdout.write(json.dumps(report, separators=(",", ":")) + chr(10))
+    return 0 if not reasons else 3
+
+
 def main():
     received_ns = time.time_ns()
     argv = sys.argv[1:]
+    if argv[:1] == ["--health"]:
+        return health()
     shadow = "--shadow" in argv
     if shadow:
         argv = [item for item in argv if item != "--shadow"]
@@ -255,6 +304,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--health"]:
+        sys.exit(health())
     try:
         code = main()
     except BaseException:
