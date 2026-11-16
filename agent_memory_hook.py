@@ -316,11 +316,21 @@ def normalize_event(event: str) -> tuple[str, str]:
     return mapping.get(event, (event.lower(), "system"))
 
 
-def build_metadata(args: argparse.Namespace, payload: Any) -> dict[str, Any]:
+def build_metadata(
+    args: argparse.Namespace,
+    payload: Any,
+    *,
+    cwd: str | None = None,
+    recorded_at: datetime | None = None,
+    environ: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """`cwd`, `recorded_at` and `environ` default to this process. The warm
+    writer passes the values the hook process captured when the event fired."""
+    recorded_at = recorded_at or datetime.now(UTC)
     metadata = {
         "hook_event": args.event,
-        "cwd": os.getcwd(),
-        "recorded_at": datetime.now(UTC).isoformat(),
+        "cwd": cwd if cwd is not None else os.getcwd(),
+        "recorded_at": recorded_at.isoformat(),
     }
     if isinstance(payload, dict):
         for canonical_name in (
@@ -342,33 +352,43 @@ def build_metadata(args: argparse.Namespace, payload: Any) -> dict[str, Any]:
     metadata["identity"] = sanitize_value(build_identity(
         payload, agent=args.agent, source=args.source,
         session_id=str(payload_field(payload, "session_id") or args.session_id or ""),
+        environ=environ, at=recorded_at.timestamp(),
     ))
     return metadata
 
 
-def configured_workspace_spaces() -> list[tuple[str, str]]:
+def configured_workspace_spaces(environ: dict[str, str] | None = None) -> list[tuple[str, str]]:
     """Parse AGENT_MEMORY_WORKSPACE_SPACES="dir-name=space,other-dir=team/space"."""
+    env = os.environ if environ is None else environ
     rules: list[tuple[str, str]] = []
-    for item in os.getenv("AGENT_MEMORY_WORKSPACE_SPACES", "").split(","):
+    for item in env.get("AGENT_MEMORY_WORKSPACE_SPACES", "").split(","):
         name, separator, space = item.partition("=")
         if separator and name.strip() and space.strip():
             rules.append((name.strip().lower(), space.strip()))
     return rules
 
 
-def derive_space(args: argparse.Namespace, payload: Any) -> str:
+def derive_space(
+    args: argparse.Namespace,
+    payload: Any,
+    *,
+    cwd: str | None = None,
+    environ: dict[str, str] | None = None,
+) -> str:
+    env = os.environ if environ is None else environ
     if args.space:
         return normalize_space(args.space)
-    env_space = os.getenv("AGENT_MEMORY_SPACE", "").strip()
+    env_space = env.get("AGENT_MEMORY_SPACE", "").strip()
     if env_space:
         return normalize_space(env_space)
+    process_cwd = cwd if cwd is not None else os.getcwd()
     cwd = ""
     if isinstance(payload, dict):
         cwd = str(payload_field(payload, "cwd") or payload_field(payload, "workspace_root") or "")
         if not cwd:
             raw_payload = payload.get("raw_payload")
             cwd = str(payload_field(raw_payload, "cwd") or payload_field(raw_payload, "workspace_root") or "")
-    cwd = cwd or os.getcwd()
+    cwd = cwd or process_cwd
     normalized = cwd.replace("\\", "/").strip("/")
     parts = [part for part in normalized.split("/") if part]
     lowered = [part.lower() for part in parts]
@@ -377,7 +397,7 @@ def derive_space(args: argparse.Namespace, payload: Any) -> str:
         tail = parts[idx + 1 : idx + 4]
         if tail:
             return normalize_space("codex/" + "/".join(tail))
-    for name, space in configured_workspace_spaces():
+    for name, space in configured_workspace_spaces(env):
         if name in lowered:
             return normalize_space(space)
     if parts:
@@ -411,6 +431,26 @@ def pending_status() -> dict[str, Any]:
         "corrupt": len(corrupt),
         "compressed_bytes": sum(path.stat().st_size for path in files if path.exists()),
     }
+
+
+def spool_inbox_status() -> dict[str, Any]:
+    """Warm-writer inbox: files waiting, files set aside, writer heartbeat."""
+    root = Path(__file__).resolve().parent / "logs"
+    inbox = root / "inbox"
+    status: dict[str, Any] = {
+        "inbox_dir": str(inbox),
+        "inbox_waiting": len(list(inbox.glob("*.hook"))) if inbox.exists() else 0,
+        "inbox_bad": len(list((inbox / "bad").glob("*.hook"))) if (inbox / "bad").exists() else 0,
+        "writer_pid": None,
+        "writer_heartbeat_age_s": None,
+    }
+    try:
+        pid_text, stamp_text = (root / "writer.heartbeat").read_text(encoding="ascii").split()[:2]
+        status["writer_pid"] = int(pid_text)
+        status["writer_heartbeat_age_s"] = round(time.time() - float(stamp_text), 1)
+    except (OSError, ValueError):
+        pass
+    return status
 
 
 def spool_pending(record: dict[str, Any]) -> str:
@@ -492,46 +532,17 @@ async def close_for_hook(conn) -> None:
         raise
 
 
+async def apply_hook_session_settings(conn) -> None:
+    await conn.execute(f"SET statement_timeout = {HOOK_STATEMENT_TIMEOUT_MS}")
+    await conn.execute(f"SET lock_timeout = {HOOK_LOCK_TIMEOUT_MS}")
+    await conn.execute(f"SET idle_in_transaction_session_timeout = {HOOK_STATEMENT_TIMEOUT_MS + 5000}")
+
+
 async def store_hook_record(record: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    event = record["event"]
-    archive = record["archive"]
     conn = await connect_for_hook()
     try:
-        await conn.execute(f"SET statement_timeout = {HOOK_STATEMENT_TIMEOUT_MS}")
-        await conn.execute(f"SET lock_timeout = {HOOK_LOCK_TIMEOUT_MS}")
-        await conn.execute(f"SET idle_in_transaction_session_timeout = {HOOK_STATEMENT_TIMEOUT_MS + 5000}")
-        async with conn.transaction():
-            result = await add_event_async(
-                agent=str(event["agent"]),
-                event_type=str(event["event_type"]),
-                space=str(event["space"]),
-                memory_kind="hook",
-                role=str(event.get("role") or ""),
-                source=str(event.get("source") or ""),
-                session_id=str(event.get("session_id") or ""),
-                content=str(event.get("content") or ""),
-                tags=[str(item) for item in event.get("tags") or []],
-                metadata=dict(event.get("metadata") or {}),
-                event_uid=str(event["event_uid"]),
-                index_entities=False,
-                conn=conn,
-            )
-            archive_result = await archive_payload_async(
-                event_id=result["id"],
-                event_uid=result["event_uid"],
-                payload=str(archive.get("payload") or ""),
-                payload_kind="hook_payload",
-                payload_format=str(archive.get("payload_format") or "json"),
-                redacted=True,
-                space=str(event["space"]),
-                session_id=str(event.get("session_id") or ""),
-                agent=str(event["agent"]),
-                event_type=str(event["event_type"]),
-                source=str(event.get("source") or ""),
-                metadata=dict(archive.get("metadata") or {}),
-                conn=conn,
-            )
-        return result, archive_result
+        await apply_hook_session_settings(conn)
+        return await write_hook_record(conn, record)
     finally:
         operation_error = sys.exception()
         try:
@@ -546,7 +557,46 @@ async def store_hook_record(record: dict[str, Any]) -> tuple[dict[str, Any], dic
                 raise
 
 
-async def replay_pending_async(limit: int = 100) -> dict[str, Any]:
+async def write_hook_record(conn, record: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """One transaction: the compact event and its full redacted archive."""
+    event = record["event"]
+    archive = record["archive"]
+    async with conn.transaction():
+        result = await add_event_async(
+            agent=str(event["agent"]),
+            event_type=str(event["event_type"]),
+            space=str(event["space"]),
+            memory_kind="hook",
+            role=str(event.get("role") or ""),
+            source=str(event.get("source") or ""),
+            session_id=str(event.get("session_id") or ""),
+            content=str(event.get("content") or ""),
+            tags=[str(item) for item in event.get("tags") or []],
+            metadata=dict(event.get("metadata") or {}),
+            event_uid=str(event["event_uid"]),
+            index_entities=False,
+            conn=conn,
+        )
+        archive_result = await archive_payload_async(
+            event_id=result["id"],
+            event_uid=result["event_uid"],
+            payload=str(archive.get("payload") or ""),
+            payload_kind="hook_payload",
+            payload_format=str(archive.get("payload_format") or "json"),
+            redacted=True,
+            space=str(event["space"]),
+            session_id=str(event.get("session_id") or ""),
+            agent=str(event["agent"]),
+            event_type=str(event["event_type"]),
+            source=str(event.get("source") or ""),
+            metadata=dict(archive.get("metadata") or {}),
+            conn=conn,
+        )
+    return result, archive_result
+
+
+async def replay_pending_async(limit: int = 100, conn=None) -> dict[str, Any]:
+    """Replay spooled records. With `conn`, reuse that open connection."""
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
     recovered = recover_stale_processing()
     replayed = 0
@@ -558,7 +608,10 @@ async def replay_pending_async(limit: int = 100) -> dict[str, Any]:
             continue
         try:
             record = load_pending(claimed)
-            result, archive_result = await store_hook_record(record)
+            if conn is None:
+                result, archive_result = await store_hook_record(record)
+            else:
+                result, archive_result = await write_hook_record(conn, record)
             claimed.unlink(missing_ok=True)
             replayed += 1
             safe_log(
@@ -594,7 +647,22 @@ async def replay_pending_async(limit: int = 100) -> dict[str, Any]:
     }
 
 
-async def run_hook(args: argparse.Namespace, raw: str, started: float) -> int:
+def build_hook_record(
+    args: argparse.Namespace,
+    raw: str,
+    *,
+    cwd: str | None = None,
+    environ: dict[str, str] | None = None,
+    received_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Build the event/archive record for one hook payload.
+
+    With no keyword arguments this reads this process's cwd, environment and
+    clock, exactly as the synchronous hook always has. The warm writer passes
+    the values the hook process captured when the event fired, so a deferred
+    write builds the same record.
+    """
+    received_at = received_at or datetime.now(UTC)
     payload, raw_payload = parse_payload(raw)
     if not args.event and isinstance(payload, dict):
         args.event = str(payload_field(payload, "hook_event_name") or "")
@@ -608,9 +676,9 @@ async def run_hook(args: argparse.Namespace, raw: str, started: float) -> int:
     archive_sha256 = hashlib.sha256(archive_text.encode("utf-8", errors="backslashreplace")).hexdigest()
     clean_payload = sanitize_value(payload)
     content = extract_text(clean_payload)
-    metadata = build_metadata(args, clean_payload)
+    metadata = build_metadata(args, clean_payload, cwd=cwd, recorded_at=received_at, environ=environ)
     session_id = session_id or str(metadata["identity"].get("session_id") or "")
-    space = derive_space(args, clean_payload)
+    space = derive_space(args, clean_payload, cwd=cwd, environ=environ)
     event_uid = make_hook_event_uid(
         agent=args.agent,
         source=args.source,
@@ -629,7 +697,7 @@ async def run_hook(args: argparse.Namespace, raw: str, started: float) -> int:
     }
     record = {
         "version": 1,
-        "created_at": datetime.now(UTC).isoformat(),
+        "created_at": received_at.isoformat(),
         "event": {
             "event_uid": event_uid,
             "agent": args.agent,
@@ -653,6 +721,28 @@ async def run_hook(args: argparse.Namespace, raw: str, started: float) -> int:
             },
         },
     }
+    return {
+        "record": record,
+        "event_type": event_type,
+        "space": space,
+        "session_id": session_id,
+        "identity": metadata["identity"],
+        "event_uid": event_uid,
+        "content": content,
+        "archive_sha256": archive_sha256,
+    }
+
+
+async def run_hook(args: argparse.Namespace, raw: str, started: float) -> int:
+    built = build_hook_record(args, raw)
+    record = built["record"]
+    event_type = built["event_type"]
+    space = built["space"]
+    session_id = built["session_id"]
+    metadata = {"identity": built["identity"]}
+    event_uid = built["event_uid"]
+    content = built["content"]
+    archive_sha256 = built["archive_sha256"]
 
     try:
         result, archive_result = await store_hook_record(record)
@@ -729,13 +819,14 @@ async def run_hook(args: argparse.Namespace, raw: str, started: float) -> int:
         return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(environ: dict[str, str] | None = None) -> argparse.ArgumentParser:
+    env = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(description="Record harness hook payload in async agent memory")
     parser.add_argument("--event", default="")
-    parser.add_argument("--agent", default=os.getenv("AGENT_MEMORY_AGENT", "agent"))
+    parser.add_argument("--agent", default=env.get("AGENT_MEMORY_AGENT", "agent"))
     parser.add_argument("--source", default="hook")
-    parser.add_argument("--space", default=os.getenv("AGENT_MEMORY_SPACE", ""))
-    parser.add_argument("--session-id", default=os.getenv("CLAUDE_CODE_SESSION_ID", os.getenv("AGENT_MEMORY_SESSION_ID", "")))
+    parser.add_argument("--space", default=env.get("AGENT_MEMORY_SPACE", ""))
+    parser.add_argument("--session-id", default=env.get("CLAUDE_CODE_SESSION_ID", env.get("AGENT_MEMORY_SESSION_ID", "")))
     parser.add_argument("--emit-json", action="store_true", help="Emit Codex/Claude hook-control JSON for explicit tests only")
     parser.add_argument("--pending-status", action="store_true", help="Show the durable failed-hook spool status")
     parser.add_argument("--replay-pending", action="store_true", help="Replay durable failed-hook spool files")
@@ -748,7 +839,7 @@ def main() -> int:
     started = time.monotonic()
     args = build_parser().parse_args()
     if args.pending_status:
-        print(json.dumps(pending_status(), indent=2, ensure_ascii=False))
+        print(json.dumps({**pending_status(), **spool_inbox_status()}, indent=2, ensure_ascii=False))
         return 0
     if args.replay_pending:
         result = asyncio.run(replay_pending_async(max(0, min(args.limit, 100000))))
@@ -757,15 +848,21 @@ def main() -> int:
     stdin_raw = ""
     if not sys.stdin.isatty():
         stdin_raw = sys.stdin.read()
+    raw = resolve_hook_input(args, stdin_raw)
+    if not args.event:
+        raise SystemExit("--event is required unless the hook payload names its event")
+    return asyncio.run(run_hook(args, raw, started))
+
+
+def resolve_hook_input(args: argparse.Namespace, stdin_raw: str) -> str:
+    """Pick stdin over argv and name the event from the payload when needed."""
     argv_raw = " ".join(args.payload).strip()
     raw = stdin_raw.strip() or argv_raw
     if not args.event:
         payload, _ = parse_payload(raw)
         if isinstance(payload, dict):
             args.event = str(payload_field(payload, "hook_event_name") or "")
-    if not args.event:
-        raise SystemExit("--event is required unless the hook payload names its event")
-    return asyncio.run(run_hook(args, raw, started))
+    return raw
 
 
 if __name__ == "__main__":

@@ -109,7 +109,11 @@ def transcript_facts(path_text: str, size: int, mtime_ns: int, full: bool) -> tu
     return header, observations
 
 
-def transcript_identity(payload: dict, identity: dict, *, full: bool = False) -> dict:
+def transcript_identity(payload: dict, identity: dict, *, full: bool = False, at: float | None = None,
+                        environ: Mapping[str, str] | None = None) -> dict:
+    """`at` is the epoch time the hook fired; a deferred writer passes it so
+    later transcript lines never attribute the event to a later model."""
+    env = os.environ if environ is None else environ
     path_text = scalar(field(payload, "transcript_path", "transcriptPath"))
     session = identity.get("session_id")
     thread = identity.get("thread_id")
@@ -118,7 +122,7 @@ def transcript_identity(payload: dict, identity: dict, *, full: bool = False) ->
     if not path_text and harness == "codex":
         lookup_id = thread or session
         if lookup_id and re.fullmatch(r"[0-9a-fA-F-]{36}", lookup_id):
-            root = Path(os.getenv("CODEX_HOME", str(Path.home() / ".codex"))) / "sessions"
+            root = Path(env.get("CODEX_HOME") or str(Path.home() / ".codex")) / "sessions"
             matches = list(root.glob(f"*/*/*/*-{lookup_id}.jsonl"))
             if len(matches) == 1:
                 path_text = str(matches[0])
@@ -149,7 +153,7 @@ def transcript_identity(payload: dict, identity: dict, *, full: bool = False) ->
         if (thread and thread != header.get("id")) or (session and session not in matches):
             return {"model_lookup": "transcript_identity_mismatch"}
         result = {"session_id": header.get("session_id") or header.get("id"), "thread_id": header.get("id"), "parent_thread_id": header.get("parent_thread_id"), "agent_path": header.get("agent_path"), "agent_name": header.get("agent_nickname"), "harness_version": header.get("cli_version"), "model_provider": header.get("model_provider"), "agent_type": header.get("thread_source")}
-    cutoff = epoch(field(payload, "timestamp", "recorded_at")) or datetime.now(UTC).timestamp()
+    cutoff = epoch(field(payload, "timestamp", "recorded_at")) or at or datetime.now(UTC).timestamp()
     tool_id = scalar(field(payload, "tool_use_id", "toolUseId"))
     turn_id = identity.get("turn_id")
     candidates = []
@@ -175,7 +179,7 @@ def transcript_identity(payload: dict, identity: dict, *, full: bool = False) ->
     return {key: value for key, value in result.items() if value not in (None, "")}
 
 
-def build_identity(payload: Any, *, agent: str = "", source: str = "", session_id: str = "", environ: Mapping[str, str] | None = None, full_transcript: bool = False) -> dict[str, Any]:
+def build_identity(payload: Any, *, agent: str = "", source: str = "", session_id: str = "", environ: Mapping[str, str] | None = None, full_transcript: bool = False, at: float | None = None) -> dict[str, Any]:
     payload = payload if isinstance(payload, dict) else {}
     env = os.environ if environ is None else environ
     supplied = field(payload.get("metadata"), "identity") or payload.get("identity") or {}
@@ -201,7 +205,7 @@ def build_identity(payload: Any, *, agent: str = "", source: str = "", session_i
             identity["thread_id"] = tid
             provenance["thread_id"] = "environment.CODEX_THREAD_ID"
     reported_model = bool(identity.get("model_id"))
-    facts = transcript_identity(payload, identity, full=full_transcript)
+    facts = transcript_identity(payload, identity, full=full_transcript, at=at, environ=env)
     for key, value in facts.items():
         if key not in identity or (key == "model_status" and not reported_model):
             identity[key] = value

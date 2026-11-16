@@ -69,6 +69,38 @@ with the absolute path. **Codex:** do the same with
 `agent_memory_hook.py --event <Name> --agent <Name>`. See
 [docs/harness-integration.md](docs/harness-integration.md).
 
+### Fast hooks (spool hook + warm writer)
+
+Every synchronous hook delays the agent. The direct `agent_memory_hook.py`
+path starts an interpreter, imports `asyncpg`, runs the password command and
+opens a new database connection for each event. On a busy Windows machine that
+was 1.5-10 s per hook once Git Bash and wrapper processes were added. The fast
+path keeps the same records and moves the database work out of the agent:
+
+- `agent_memory_spool_hook.py` imports only the standard library (run it as
+  `python -I -S`). It writes the raw event, the hook's argv, cwd, fire time and
+  memory-related environment to `logs/inbox/*.hook` (fsync, atomic rename),
+  starts the writer if none holds `logs/writer.lock`, and exits 0. Secret-named
+  variables are never spooled.
+- `agent_memory_writer.py` is one long-lived process. It runs the password
+  command once, keeps one connection, builds each record with the same
+  `build_hook_record()` the direct hook uses, and commits the event and its
+  archive in one transaction. A spool file is deleted only after commit; a
+  database outage leaves files in the inbox, three failed writes of one event
+  move it to `logs/pending`, and an unreadable file moves to `logs/inbox/bad/`.
+  It restarts itself when its source files change.
+- [`hooks/claude_settings.fast.example.json`](hooks/claude_settings.fast.example.json)
+  runs the spool hook in exec form (`command` + `args`, so Claude Code starts
+  no shell) with `"async": true`, except `SessionEnd`, which stays synchronous
+  because a session's last events must be on disk before it exits.
+- `agent_memory_hook.py --pending-status` also reports the inbox and the
+  writer heartbeat. `--shadow` on the spool hook verifies events against rows
+  another hook path stored, without writing, for testing a rollout.
+
+A session whose environment points memory at another database or log folder
+(`MEMORY_DB_*`, `AGENT_MEMORY_ENV_FILE`, `AGENT_MEMORY_LOG_DIR`,
+`AGENT_MEMORY_PENDING_DIR`) falls back to the direct hook automatically.
+
 Then tell the agent the memory exists. Add a short section to `CLAUDE.md` /
 `AGENTS.md` (there's one ready to paste in the integration doc) or install
 [`skills/agent-memory-blueprint`](skills/agent-memory-blueprint/SKILL.md).
@@ -118,8 +150,8 @@ are recovery tools; [docs/architecture.md](docs/architecture.md) covers them.
 
 ```text
  harness hook (stdin JSON)
-        │
-        ▼
+        │            fast path: agent_memory_spool_hook.py ─► logs/inbox ─► agent_memory_writer.py
+        ▼            (both build records with the same code below)
  agent_memory_hook.py ── redact ── compact ── choose space ── attach model/session identity
         │                                                      │
         │  one transaction                                     │  DB down?

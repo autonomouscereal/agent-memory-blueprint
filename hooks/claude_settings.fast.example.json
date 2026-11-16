@@ -1,0 +1,166 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": [
+              "-I",
+              "-S",
+              "/path/to/agent-memory-blueprint/agent_memory_spool_hook.py",
+              "--event",
+              "UserPromptSubmit",
+              "--agent",
+              "ClaudeCode",
+              "--source",
+              "claude_hook"
+            ],
+            "async": true,
+            "statusMessage": "Filing prompt into memory..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": [
+              "-I",
+              "-S",
+              "/path/to/agent-memory-blueprint/agent_memory_spool_hook.py",
+              "--event",
+              "PostToolUse",
+              "--agent",
+              "ClaudeCode",
+              "--source",
+              "claude_hook"
+            ],
+            "async": true,
+            "statusMessage": "Filing tool call into memory..."
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": [
+              "-I",
+              "-S",
+              "/path/to/agent-memory-blueprint/agent_memory_spool_hook.py",
+              "--event",
+              "PostToolUseFailure",
+              "--agent",
+              "ClaudeCode",
+              "--source",
+              "claude_hook"
+            ],
+            "async": true,
+            "statusMessage": "Filing failed tool call into memory..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": [
+              "-I",
+              "-S",
+              "/path/to/agent-memory-blueprint/agent_memory_spool_hook.py",
+              "--event",
+              "Stop",
+              "--agent",
+              "ClaudeCode",
+              "--source",
+              "claude_hook"
+            ],
+            "async": true,
+            "statusMessage": "Finalizing memory for this turn..."
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": [
+              "-I",
+              "-S",
+              "/path/to/agent-memory-blueprint/agent_memory_spool_hook.py",
+              "--event",
+              "StopFailure",
+              "--agent",
+              "ClaudeCode",
+              "--source",
+              "claude_hook"
+            ],
+            "async": true,
+            "statusMessage": "Recording failed turn in memory..."
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": [
+              "-I",
+              "-S",
+              "/path/to/agent-memory-blueprint/agent_memory_spool_hook.py",
+              "--event",
+              "PreCompact",
+              "--agent",
+              "ClaudeCode",
+              "--source",
+              "claude_hook"
+            ],
+            "async": true,
+            "statusMessage": "Recording compaction boundary in memory..."
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": [
+              "-I",
+              "-S",
+              "/path/to/agent-memory-blueprint/agent_memory_spool_hook.py",
+              "--event",
+              "SessionEnd",
+              "--agent",
+              "ClaudeCode",
+              "--source",
+              "claude_hook"
+            ],
+            "timeout": 10,
+            "statusMessage": "Finalizing session in memory..."
+          }
+        ]
+      }
+    ]
+  }
+}

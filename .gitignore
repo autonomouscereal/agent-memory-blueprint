@@ -12,6 +12,8 @@
 
 !agent_memory.py
 !agent_memory_hook.py
+!agent_memory_spool_hook.py
+!agent_memory_writer.py
 !agent_identity.py
 !identity_history.py
 !codex_transcript_import.py
@@ -21,6 +23,7 @@
 !test_status.py
 !test_self_test.py
 !test_connection_cleanup.py
+!test_spool_writer.py
 
 !docs/
 !docs/*.md
