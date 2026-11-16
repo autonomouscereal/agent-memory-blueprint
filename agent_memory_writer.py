@@ -193,6 +193,8 @@ class Writer:
         self.conn: asyncpg.Connection | None = None
         self.config: dict[str, Any] | None = None
         self.attempts: dict[str, int] = {}
+        self.read_attempts: dict[str, int] = {}
+        self.committed: set[str] = set()
         self.backoff = 0.0
         self.started = time.monotonic()
         self.written = 0
@@ -230,16 +232,44 @@ class Writer:
                 pass
         self.conn = None
 
-    async def process(self, path: Path) -> bool:
-        """Write one spool file. False means stop this pass and back off."""
+    def remove(self, path: Path) -> None:
+        """Delete a committed spool file. A file another process holds open
+        (antivirus, indexer) is retried on later passes, never rewritten."""
+        for _ in range(5):
+            try:
+                path.unlink(missing_ok=True)
+                self.committed.discard(path.name)
+                return
+            except OSError:
+                time.sleep(0.05)
+        self.committed.add(path.name)
+
+    async def process(self, path: Path) -> str:
+        """Write one spool file: "done", "deferred" (retry later) or "stop"."""
+        if path.name in self.committed:
+            self.remove(path)
+            return "deferred" if path.name in self.committed else "done"
         try:
             header, raw = read_spool(path)
-            args, built = build_from_spool(header, raw)
         except FileNotFoundError:
-            return True
+            return "done"
+        except OSError as exc:
+            # Windows sharing violation while a scanner holds the new file.
+            attempts = self.read_attempts.get(path.name, 0) + 1
+            self.read_attempts[path.name] = attempts
+            if attempts == 1 or attempts % 50 == 0:
+                writer_log({"ok": False, "event": "read_deferred", "spool_file": path.name, "attempt": attempts,
+                            "error_type": type(exc).__name__, "error": str(exc)[:300]})
+            return "deferred"
         except Exception as exc:
             quarantine(path, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
-            return True
+            return "done"
+        self.read_attempts.pop(path.name, None)
+        try:
+            args, built = build_from_spool(header, raw)
+        except Exception as exc:
+            quarantine(path, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+            return "done"
         record = built["record"]
         started = time.monotonic()
         try:
@@ -253,7 +283,7 @@ class Writer:
             self.backoff = min(max(self.backoff * 2, 0.5), 10.0)
             writer_log({"ok": False, "event": "connection_error", "error_type": type(exc).__name__,
                         "error": str(exc)[:500], "backoff_s": self.backoff})
-            return False
+            return "stop"
         except Exception as exc:
             attempts = self.attempts.get(path.name, 0) + 1
             self.attempts[path.name] = attempts
@@ -263,9 +293,9 @@ class Writer:
                 self.backoff = min(max(self.backoff * 2, 0.5), 10.0)
                 writer_log({"ok": False, "event": "write_retry", "attempt": attempts, "spool_file": path.name,
                             "error_type": type(exc).__name__, "error": str(exc)[:500]})
-                return False
+                return "stop"
             pending_file = amh.spool_pending(record)
-            path.unlink(missing_ok=True)
+            self.remove(path)
             self.attempts.pop(path.name, None)
             amh.safe_log("agent_memory_hook_errors.jsonl", {
                 "ok": False,
@@ -284,8 +314,8 @@ class Writer:
                 "driver": "asyncpg",
                 "pid": os.getpid(),
             })
-            return True
-        path.unlink(missing_ok=True)
+            return "done"
+        self.remove(path)
         self.attempts.pop(path.name, None)
         self.backoff = 0.0
         self.written += 1
@@ -319,7 +349,7 @@ class Writer:
             "driver": "asyncpg",
             "pid": os.getpid(),
         })
-        return True
+        return "done"
 
     async def verify_shadow(self) -> None:
         """Check each shadow spool file against the row the synchronous hook
@@ -395,17 +425,22 @@ class Writer:
                 write_heartbeat()
                 last_heartbeat = now
             files = list_inbox()
+            progressed = False
             for path in files:
-                if not await self.process(path):
+                outcome = await self.process(path)
+                if outcome == "stop":
                     break
+                progressed = progressed or outcome == "done"
                 if time.monotonic() - last_heartbeat >= HEARTBEAT_EVERY_S:
                     write_heartbeat()
                     last_heartbeat = time.monotonic()
             if self.backoff:
                 await asyncio.sleep(self.backoff)
                 continue
-            if files:
+            if progressed:
                 continue
+            if files:
+                await asyncio.sleep(0.2)  # Only deferred files left: retry shortly.
             if now - last_shadow >= SHADOW_CHECK_EVERY_S:
                 last_shadow = now
                 await self.verify_shadow()
