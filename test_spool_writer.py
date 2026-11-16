@@ -130,5 +130,50 @@ class SpoolWriterEquivalence(unittest.TestCase):
         self.assertEqual(report["inbox_waiting"], 1)
 
 
+class EventsLogParts(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp(prefix="evlog-test-"))
+        self.live = self.dir / "agent_memory_hook_events.jsonl"
+        self.lines = [json.dumps({"i": i, "t": "café " + "x" * (i % 200)}, ensure_ascii=False) + "\n" for i in range(5000)]
+        self.live.write_text("".join(self.lines), encoding="utf-8", newline="\n")
+        self.logged: list[dict] = []
+        self.original_log = amw.writer_log
+        amw.writer_log = self.logged.append
+
+    def tearDown(self) -> None:
+        amw.writer_log = self.original_log
+
+    def test_roll_compress_keeps_every_line(self) -> None:
+        import gzip
+
+        self.assertIsNone(amw.roll_events_log(self.dir, self.live.stat().st_size + 1))
+        part = amw.roll_events_log(self.dir, 1)
+        self.assertIsNotNone(part)
+        self.assertFalse(self.live.exists())
+        amw.compress_pending_parts(self.dir)
+        target = part.with_name(part.name + ".gz")
+        self.assertTrue(target.exists())
+        self.assertFalse(part.exists())
+        with gzip.open(target, "rt", encoding="utf-8", newline="") as stream:
+            self.assertEqual(stream.read(), "".join(self.lines))
+        self.assertTrue(self.logged[-1]["verified"])
+        self.assertEqual(self.logged[-1]["lines"], len(self.lines))
+
+    def test_held_open_log_is_not_renamed(self) -> None:
+        with open(self.live, "a", encoding="utf-8"):
+            if os.name == "nt":
+                self.assertIsNone(amw.roll_events_log(self.dir, 1))
+                self.assertTrue(self.live.exists())
+
+    def test_killed_compression_resumes(self) -> None:
+        part = self.dir / "agent_memory_hook_events.20990101T000000Z.jsonl"
+        part.write_text("".join(self.lines[:7]), encoding="utf-8", newline="\n")
+        (self.dir / (part.name + ".gz.tmp")).write_bytes(b"partial")
+        amw.compress_pending_parts(self.dir)
+        self.assertTrue((self.dir / (part.name + ".gz")).exists())
+        self.assertFalse(part.exists())
+        self.assertFalse((self.dir / (part.name + ".gz.tmp")).exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

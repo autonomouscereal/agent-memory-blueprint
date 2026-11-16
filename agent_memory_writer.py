@@ -70,6 +70,7 @@ if __name__ == "__main__" and LOCK_FD is None:
 import asyncio  # noqa: E402
 import hashlib  # noqa: E402
 import json  # noqa: E402
+import threading  # noqa: E402
 import traceback  # noqa: E402
 from datetime import UTC, datetime  # noqa: E402
 from typing import Any  # noqa: E402
@@ -186,6 +187,115 @@ def quarantine(path: Path, reason: str) -> None:
         "spooled": True,
         "pid": os.getpid(),
     })
+
+
+# --- Hook events log: dated, compressed parts; every line kept --------------
+# logs/agent_memory_hook_events.jsonl stays plain text, so every appender
+# (this writer, the direct hook, Codex's hooks) keeps its locked append.
+# Past EVENTS_LOG_ROLL_BYTES the writer renames it to a dated part, gzips
+# the part, reads the gzip back and compares the SHA-256 and line count of
+# the decompressed bytes with the original, and only then removes the plain
+# copy. Nothing is discarded: the parts hold every line, in order.
+EVENTS_LOG_NAME = "agent_memory_hook_events"
+EVENTS_LOG_ROLL_BYTES = int(os.getenv("AGENT_MEMORY_EVENTS_LOG_ROLL_BYTES", str(64 * 1024 * 1024)))
+EVENTS_LOG_CHECK_EVERY_S = 60.0
+_compress_lock = threading.Lock()
+
+
+def events_log_dir() -> Path:
+    return Path(amh.LOG_DIR)
+
+
+def roll_events_log(log_dir: Path | None = None, roll_bytes: int | None = None) -> Path | None:
+    """Rename the live log to a dated part when it is past the size. A rename
+    that another process blocks (an append in progress) waits for next time."""
+    log_dir = log_dir or events_log_dir()
+    roll_bytes = EVENTS_LOG_ROLL_BYTES if roll_bytes is None else roll_bytes
+    live = log_dir / f"{EVENTS_LOG_NAME}.jsonl"
+    try:
+        if live.stat().st_size < roll_bytes:
+            return None
+    except FileNotFoundError:
+        return None
+    part = log_dir / f"{EVENTS_LOG_NAME}.{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.jsonl"
+    if part.exists():
+        return None
+    try:
+        os.replace(live, part)
+    except OSError:
+        return None
+    return part
+
+
+def compress_part(part: Path) -> dict[str, Any]:
+    """gzip one plain part, verify it byte for byte, then remove the plain copy."""
+    import gzip  # noqa: PLC0415
+
+    target = part.with_name(part.name + ".gz")
+    temp = part.with_name(part.name + ".gz.tmp")
+    source_hash = hashlib.sha256()
+    source_lines = 0
+    with part.open("rb") as source, gzip.open(temp, "wb", compresslevel=6) as sink:
+        while True:
+            chunk = source.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            source_hash.update(chunk)
+            source_lines += chunk.count(b"\n")
+            sink.write(chunk)
+    with temp.open("ab") as raw:  # fsync needs a writable handle on Windows
+        os.fsync(raw.fileno())
+    check_hash = hashlib.sha256()
+    check_lines = 0
+    with gzip.open(temp, "rb") as check:
+        while True:
+            chunk = check.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            check_hash.update(chunk)
+            check_lines += chunk.count(b"\n")
+    result = {"part": part.name, "plain_bytes": part.stat().st_size, "gzip_bytes": temp.stat().st_size,
+              "lines": source_lines, "sha256": source_hash.hexdigest(),
+              "verified": check_hash.digest() == source_hash.digest() and check_lines == source_lines}
+    if not result["verified"]:
+        temp.unlink(missing_ok=True)
+        return result  # The plain part stays; a later pass tries again.
+    os.replace(temp, target)
+    part.unlink()
+    return result
+
+
+def pending_parts(log_dir: Path | None = None) -> list[Path]:
+    log_dir = log_dir or events_log_dir()
+    return sorted(p for p in log_dir.glob(f"{EVENTS_LOG_NAME}.*.jsonl") if p.is_file())
+
+
+def compress_pending_parts(log_dir: Path | None = None) -> None:
+    if not _compress_lock.acquire(blocking=False):
+        return  # One compression at a time.
+    try:
+        log_dir = log_dir or events_log_dir()
+        for stale in log_dir.glob(f"{EVENTS_LOG_NAME}.*.jsonl.gz.tmp"):
+            stale.unlink(missing_ok=True)
+        for part in pending_parts(log_dir):
+            started = time.monotonic()
+            try:
+                result = compress_part(part)
+            except Exception as exc:  # noqa: BLE001 - the plain part stays
+                writer_log({"ok": False, "event": "events_log_compress_error", "part": part.name,
+                            "error_type": type(exc).__name__, "error": str(exc)[:300]})
+                continue
+            result["seconds"] = round(time.monotonic() - started, 1)
+            writer_log({"ok": result["verified"], "event": "events_log_compressed", **result})
+    finally:
+        _compress_lock.release()
+
+
+def maintain_events_log() -> None:
+    """Roll when due, then compress any plain parts in a background thread."""
+    roll_events_log()
+    if pending_parts() and not _compress_lock.locked():
+        threading.Thread(target=compress_pending_parts, name="events-log-compress", daemon=True).start()
 
 
 class Writer:
@@ -418,6 +528,7 @@ class Writer:
         last_heartbeat = last_source = 0.0
         last_pending = time.monotonic() - PENDING_REPLAY_EVERY_S + 2
         last_shadow = 0.0
+        last_events_log = 0.0
         writer_log({"ok": True, "event": "started", "python": sys.version.split()[0]})
         while True:
             now = time.monotonic()
@@ -448,6 +559,12 @@ class Writer:
                 last_source = now
                 if source_stamp() != stamp:
                     return "source_changed"
+            if now - last_events_log >= EVENTS_LOG_CHECK_EVERY_S:
+                last_events_log = now
+                try:
+                    maintain_events_log()
+                except Exception as exc:  # noqa: BLE001 - logging upkeep never stops writes
+                    writer_log({"ok": False, "event": "events_log_maintain_error", "error": str(exc)[:300]})
             if now - last_pending >= PENDING_REPLAY_EVERY_S:
                 last_pending = now
                 await self.replay_pending()
