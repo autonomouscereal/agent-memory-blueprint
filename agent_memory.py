@@ -1356,11 +1356,16 @@ async def init_db_async(*, recount_spaces: bool = False) -> dict[str, Any]:
             WHERE session_id IS NOT NULL
         """)
         for key in IDENTITY_AUDIT_KEYS:
-            await _ensure_index_concurrently(conn, f"agent_memory_events_identity_{key}_idx", f"""
-                CREATE INDEX CONCURRENTLY agent_memory_events_identity_{key}_idx
-                ON agent_memory_events ((metadata->'identity'->>'{key}'), created_at DESC)
+            # NULLS LAST matches audit's identity ORDER BY, which the plain
+            # created_at index (NULLS FIRST) cannot serve; see audit_events_async.
+            await _ensure_index_concurrently(conn, f"agent_memory_events_identity_{key}_newest_idx", f"""
+                CREATE INDEX CONCURRENTLY agent_memory_events_identity_{key}_newest_idx
+                ON agent_memory_events ((metadata->'identity'->>'{key}'), created_at DESC NULLS LAST)
                 WHERE (metadata->'identity'->>'{key}') IS NOT NULL
             """)
+            # The first build of 76859c6 (created_at DESC); the planner could
+            # skip it in favour of a created_at walk.
+            await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS agent_memory_events_identity_{key}_idx")
         return {"ok": True, "message": "agent_memory_events schema ready", "driver": "asyncpg", **space_counts,
                 "trigram_fastupdate_turned_off": trigram_direct}
     finally:
@@ -3331,11 +3336,20 @@ async def audit_events_async(
     # before (metadata->'identity' @> {...}) has no statistics, so the plan
     # flipped between a bitmap over every match (harness=claude_code, 469k
     # rows: 18.6 s) and a newest-first walk (seconds for a rare or old value).
-    for key, value in (("model_id", model_id), ("harness", harness), ("thread_id", thread_id), ("model_provider", provider)):
-        if value:
+    identity = {"model_id": model_id, "harness": harness, "thread_id": thread_id, "model_provider": provider}
+    for key in ("model_id", "harness", "thread_id", "model_provider"):
+        if identity[key]:
             filters.append(f"(metadata->'identity'->>'{key}') = ${idx}")
-            params.append(value)
+            params.append(identity[key])
             idx += 1
+    # With accurate statistics the planner still preferred walking the
+    # created_at index backwards for harness=codex (11% of rows, none in the
+    # newest 243k: 1.0-1.4 s), since it assumes matches spread evenly.
+    # created_at is NOT NULL, so NULLS LAST returns the same rows in the same
+    # order, but only the identity indexes (built NULLS LAST) can supply it.
+    # Ordering by the filtered field first does not help: the planner drops a
+    # sort key fixed by an equality.
+    order_sql = "created_at DESC NULLS LAST" if any(identity.values()) else "created_at DESC"
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
     params.append(limit)
     sql = f"""
@@ -3343,7 +3357,7 @@ async def audit_events_async(
                summary, tags, metadata - 'raw_payload' AS metadata, left(content, 2400) AS content
         FROM agent_memory_events
         {where}
-        ORDER BY created_at DESC
+        ORDER BY {order_sql}
         LIMIT ${idx}
         """
 

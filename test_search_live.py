@@ -291,8 +291,8 @@ class LiveSpaceCountTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await conn.close()
         self.assertEqual([(r["relname"], r["indisvalid"]) for r in indexes], [
-            ("agent_memory_events_identity_harness_idx", True), ("agent_memory_events_identity_model_id_idx", True),
-            ("agent_memory_events_identity_model_provider_idx", True), ("agent_memory_events_identity_thread_id_idx", True),
+            ("agent_memory_events_identity_harness_newest_idx", True), ("agent_memory_events_identity_model_id_newest_idx", True),
+            ("agent_memory_events_identity_model_provider_newest_idx", True), ("agent_memory_events_identity_thread_id_newest_idx", True),
         ])
 
 
