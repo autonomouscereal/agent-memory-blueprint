@@ -36,11 +36,25 @@
 !skills/
 !skills/agent-memory-blueprint/
 !skills/agent-memory-blueprint/SKILL.md
+!skills/agent-memory-backup/
+!skills/agent-memory-backup/SKILL.md
+!skills/agent-memory-backup/scripts/
+!skills/agent-memory-backup/scripts/backup_agent_memory_pg.sh
+!skills/agent-memory-backup/scripts/backup_pg_db.sh
+!skills/agent-memory-backup/scripts/backup_runner.py
+!skills/agent-memory-backup/scripts/restore_test_agent_memory.sh
+!skills/agent-memory-backup/scripts/run_remote_backup.py
+!skills/agent-memory-backup/scripts/agent-memory-backup.env.example
+!skills/agent-memory-backup/scripts/pg-db-backup.env.example
+!skills/agent-memory-backup/scripts/tests/
+!skills/agent-memory-backup/scripts/tests/test_backup_agent_memory_pg.sh
+!skills/agent-memory-backup/scripts/tests/test_backup_pg_db.sh
 
 # Belt and braces: never these, even if someone adds an allow rule above.
 .env
 .env.*
 !.env.example
+*.env
 logs/
 __pycache__/
 *.pyc

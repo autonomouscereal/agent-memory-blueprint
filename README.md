@@ -215,6 +215,31 @@ hook's working directory, so a project's own `.env` can't redirect memory.
 - `.gitignore` here is an allowlist, so the folder can double as a live
   install without logs, spooled payloads or local notes ever getting committed.
 
+## Backups
+
+[`skills/agent-memory-backup`](skills/agent-memory-backup/SKILL.md) is the nightly backup we run for this
+database, with raw `pg_dump` / `pg_restore` / `psql` inside the container and no stored credential:
+
+- **One verified backup.** Each run dumps to a local stage, copies it to a NAS share, checks size, SHA-256 and a
+  complete `pg_restore --list` against the dump-time list, publishes with renames and an atomic pointer swap, and
+  only then deletes the previous backup. A failed or partial copy is deleted; the previous backup is never touched
+  before the new one verifies.
+- **Gentle on the NAS.** The copy runs in paced `rsync --append` steps inside a UTC window, waits while a pool-state
+  probe on the NAS says BUSY, stops before a free-space floor, and resumes a paused copy the next night.
+- **Proven restorable.** A weekly test restores the published dump into a throwaway container and compares exact row
+  counts with the live database.
+- **Siblings.** `backup_pg_db.sh` covers the smaller databases in the same container (snapshot dump, exact restore
+  test, daily/weekly rotation), and never copies to the share while the memory backup does.
+
+A machine's own paths go in `agent-memory-backup.env` / `pg-db-backup.env` beside the installed scripts (templates
+in [`scripts/`](skills/agent-memory-backup/scripts/)); they are gitignored like `.env`. Both test suites run on Linux
+with fake `docker`/`rsync` in temp dirs:
+
+```bash
+bash skills/agent-memory-backup/scripts/tests/test_backup_agent_memory_pg.sh
+bash skills/agent-memory-backup/scripts/tests/test_backup_pg_db.sh
+```
+
 ## Limits
 
 - The built-in embedder is a deterministic lexical feature hash, not a neural
