@@ -78,7 +78,8 @@ PEM_PRIVATE_KEY_RE = re.compile(
 )
 JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
 PROVIDER_TOKEN_RE = re.compile(
-    r"\b(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})\b"
+    r"\b(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}"
+    r"|AIza[0-9A-Za-z_-]{30,}|(?:sk|rk|pk|whsec)_(?:live|test)_[A-Za-z0-9]{16,}|hf_[A-Za-z0-9]{30,}|xai-[A-Za-z0-9_-]{20,})\b"
 )
 DATA_URL_RE = re.compile(r"^data:([^;,]+)?(?:;[^,]*)?,", re.IGNORECASE)
 MAX_HOOK_STRING_CHARS = int(os.getenv("AGENT_MEMORY_HOOK_MAX_STRING_CHARS", "12000"))
