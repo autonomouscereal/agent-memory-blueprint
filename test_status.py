@@ -70,7 +70,7 @@ class StatusTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_details_preserves_exact_aggregates_and_breakdowns(self):
         connection = AsyncMock()
-        connection.fetchval.side_effect = [42, 2, True, False]
+        connection.fetchval.side_effect = [42, 2, True, False, False]
         connection.fetch.side_effect = [
             [{"space": "workspace/example", "events": 42}],
             [{"space": "workspace/example", "agent": "Codex", "event_type": "note", "count": 42}],
@@ -98,6 +98,8 @@ class StatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["breakdown"][0]["count"], 42)
         # A database that has not run the new init yet reports the old global scope.
         self.assertEqual(result["search_cache"]["scope"], "global")
+        # ...and counts spaces per listing until init installs the count triggers.
+        self.assertEqual(result["space_counts"], "counted per listing")
         sql = " ".join(call.args[0] for call in connection.mock_calls if call.args)
         self.assertIn("SELECT count(*) AS total FROM agent_memory_events", sql)
         self.assertIn("sum(raw_chars)", sql)

@@ -96,6 +96,8 @@ def base_rules(max_id=1000, cache_row=None, state=None, text_recent=(), text_old
         ("FROM agent_memory_space_search_state", state),
         ("FROM agent_memory_search_cache cache", cache_row),
         ("SELECT count(*)", in_range),
+        # The older pass in a space (bitmap scans only); it ends like the recent pass.
+        ("AND (id + 0) > $2 AND (id + 0) <= $3 ORDER BY id DESC LIMIT $4", lambda args: [{"id": i} for i in text_older]),
         ("ORDER BY id DESC LIMIT $4", lambda args: [{"id": i} for i in text_recent]),
         ("OFFSET 0", lambda args: [{"id": i} for i in text_older]),
         ("ORDER BY ts_rank_cd(search_vector", lambda args: [{"id": i} for i in list(args[1])[:args[2]]]),
@@ -162,18 +164,42 @@ class NewestTextMatchTests(unittest.IsolatedAsyncioTestCase):
         budget = agent_memory.SearchBudget(15000, 5000)
         ids = await agent_memory.newest_text_match_ids(
             conn, budget, tsquery_function="websearch_to_tsquery", query="zygote",
-            scope={"space": "workspace/a"}, need=10, upper_id=1000, window=200,
+            scope={"agent": "Codex"}, need=10, upper_id=1000, window=200,
         )
         self.assertEqual(ids, [999, 40, 7])
         older = conn.sql("fetch")[1]
         self.assertIn("OFFSET 0", older)
         self.assertIn("(id + 0) > $2 AND (id + 0) <= $3", older)
-        self.assertIn("WHERE space = $5 ORDER BY m.id DESC LIMIT $4", older)
+        self.assertIn("WHERE agent = $5 ORDER BY m.id DESC LIMIT $4", older)
         executes = conn.sql("execute")
         self.assertIn("SELECT set_config('enable_seqscan', 'off', true)", executes)
+        self.assertNotIn("SELECT set_config('enable_indexscan', 'off', true)", executes)
         self.assertEqual(executes[-1], "SELECT set_config('enable_seqscan', 'on', true)")
         args = [args for kind, _sql, args in conn.calls if kind == "fetch"][1]
         self.assertEqual(args[:4], ("zygote", 0, 800, 9))
+
+    async def test_older_pass_in_a_space_lets_the_planner_and_the_space_index(self):
+        conn = FakeConnection(base_rules(text_recent=[999], text_older=[40, 7]))
+        budget = agent_memory.SearchBudget(15000, 5000)
+        ids = await agent_memory.newest_text_match_ids(
+            conn, budget, tsquery_function="plainto_tsquery", query="memory",
+            scope={"space": "workspace/a"}, need=10, upper_id=1000, window=200,
+        )
+        self.assertEqual(ids, [999, 40, 7])
+        older = conn.sql("fetch")[1]
+        # No OFFSET 0 fence: the space test and the tsvector test sit in one scan,
+        # so the planner can AND the space index bitmap with the GIN bitmap.
+        self.assertNotIn("OFFSET 0", older)
+        self.assertIn("WHERE space = $5 AND search_vector @@ plainto_tsquery('english', $1) "
+                      "AND (id + 0) > $2 AND (id + 0) <= $3 ORDER BY id DESC LIMIT $4", older)
+        executes = conn.sql("execute")
+        # Bitmap scans only: no seq scan and no row-by-row index walk.
+        self.assertIn("SELECT set_config('enable_seqscan', 'off', true)", executes)
+        self.assertIn("SELECT set_config('enable_indexscan', 'off', true)", executes)
+        self.assertEqual(executes[-2:], ["SELECT set_config('enable_seqscan', 'on', true)",
+                                         "SELECT set_config('enable_indexscan', 'on', true)"])
+        args = [args for kind, _sql, args in conn.calls if kind == "fetch"][1]
+        self.assertEqual(args[:5], ("memory", 0, 800, 9, "workspace/a"))
 
     async def test_enough_recent_matches_skip_the_older_pass(self):
         conn = FakeConnection(base_rules(text_recent=[999, 998, 997], text_older=[5]))
@@ -365,6 +391,91 @@ class GrepTests(unittest.IsolatedAsyncioTestCase):
         sql = [sql for sql in conn.sql("fetch") if "ILIKE" in sql][0]
         self.assertIn("id > $2 AND id <= $3 AND content ILIKE '%' || $1 || '%'", sql)
         self.assertIn("ORDER BY id DESC LIMIT $4", sql)
+
+
+def audit_row(row_id):
+    return {"id": row_id, "created_at": "2026-11-24T00:00:00+00:00", "space": "workspace/a", "session_id": "s",
+            "agent": "ClaudeCode", "event_type": "tool_call", "memory_kind": "hook", "role": None, "source": None,
+            "summary": "", "tags": [], "metadata": {}, "content": ""}
+
+
+class AuditTests(unittest.IsolatedAsyncioTestCase):
+    async def test_identity_audit_walks_created_at_first(self):
+        conn = FakeConnection([("ORDER BY created_at DESC", [audit_row(9), audit_row(8)])])
+        with patch.object(agent_memory, "connect", AsyncMock(return_value=conn)):
+            rows = await agent_memory.audit_events_async(limit=2, harness="claude_code", all_spaces=True)
+        self.assertEqual([row["id"] for row in rows], [9, 8])
+        self.assertEqual(len(conn.sql("fetch")), 1)
+        walk = [call for call in conn.calls if call[0] == "execute"][0]
+        self.assertIn("set_config('enable_bitmapscan', 'off', true)", walk[1])
+        self.assertIn("set_config('statement_timeout', $1, true)", walk[1])
+        self.assertEqual(walk[2], ("500",))
+        args = [args for kind, _sql, args in conn.calls if kind == "fetch"][0]
+        self.assertEqual(args, ({"harness": "claude_code"}, 2))
+
+    async def test_identity_audit_falls_back_to_the_gin_bitmap(self):
+        answers = [asyncpg.QueryCanceledError("canceling statement due to statement timeout"), [audit_row(5)]]
+
+        def answer(_args):
+            item = answers.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+        conn = FakeConnection([("ORDER BY created_at DESC", answer)])
+        with patch.object(agent_memory, "connect", AsyncMock(return_value=conn)):
+            rows = await agent_memory.audit_events_async(limit=20, harness="hermes", all_spaces=True)
+        self.assertEqual([row["id"] for row in rows], [5])
+        self.assertEqual(len(conn.sql("fetch")), 2)
+        self.assertTrue(conn.closed)
+
+    async def test_session_audit_runs_one_plain_query(self):
+        conn = FakeConnection([("ORDER BY created_at DESC", [audit_row(3)])])
+        with patch.object(agent_memory, "connect", AsyncMock(return_value=conn)):
+            rows = await agent_memory.audit_events_async(limit=20, session_id="s", all_spaces=True)
+        self.assertEqual([row["id"] for row in rows], [3])
+        self.assertEqual(conn.sql("execute"), [])
+        self.assertIn("WHERE session_id = $1", conn.sql("fetch")[0])
+
+
+class SpaceCountTests(unittest.IsolatedAsyncioTestCase):
+    async def test_listing_reads_the_maintained_counts(self):
+        conn = FakeConnection([
+            ("attname = 'event_count'", True),
+            ("LEFT JOIN agent_memory_space_search_state c", [{"space": "workspace/a", "event_count": 7}]),
+        ])
+        with patch.object(agent_memory, "connect", AsyncMock(return_value=conn)):
+            rows = await agent_memory.list_spaces_async()
+        self.assertEqual(rows, [{"space": "workspace/a", "event_count": 7}])
+        self.assertFalse([sql for sql in conn.sql("fetch") if "count(e.id)" in sql])
+
+    async def test_listing_counts_rows_until_init_installs_the_triggers(self):
+        conn = FakeConnection([
+            ("attname = 'event_count'", False),
+            ("count(e.id) AS event_count", [{"space": "workspace/a", "event_count": 7}]),
+        ])
+        with patch.object(agent_memory, "connect", AsyncMock(return_value=conn)):
+            rows = await agent_memory.list_spaces_async()
+        self.assertEqual(rows[0]["event_count"], 7)
+
+    async def test_first_count_locks_inserts_before_counting(self):
+        conn = FakeConnection([("attname = 'event_count'", False)])
+        result = await agent_memory.ensure_space_counts_async(conn)
+        self.assertTrue(result["recounted"])
+        executes = conn.sql("execute")
+        self.assertEqual(executes[0], "LOCK TABLE agent_memory_events IN SHARE MODE")
+        self.assertIn("ADD COLUMN IF NOT EXISTS event_count BIGINT", executes[1])
+        self.assertTrue(any("CREATE TRIGGER agent_memory_events_count_insert_trg" in sql for sql in executes))
+        self.assertTrue(any("AFTER DELETE OR UPDATE OF space ON agent_memory_events" in sql for sql in executes))
+        # Zero first, so a space whose rows were all deleted reads 0, then the exact counts.
+        self.assertEqual(executes[-2], "UPDATE agent_memory_space_search_state SET event_count = 0")
+        self.assertIn("SELECT space, count(*), NOW() FROM agent_memory_events GROUP BY space", executes[-1])
+
+    async def test_maintained_counts_take_no_lock(self):
+        conn = FakeConnection([("attname = 'event_count'", True)])
+        result = await agent_memory.ensure_space_counts_async(conn)
+        self.assertFalse(result["recounted"])
+        self.assertEqual(conn.sql("execute"), [])
 
 
 if __name__ == "__main__":

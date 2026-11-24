@@ -445,7 +445,11 @@ async def newest_text_match_ids(
        through the GIN index alone. OFFSET 0 keeps the scope filters out of the
        inner scan, and seq scans are off, so no plan filters a large space row
        by row and detoasts each search_vector; the cost follows the number of
-       matches.
+       matches. With a space filter, the pass uses bitmap scans only instead,
+       so the planner can AND the GIN bitmap with the space index: "memory" in
+       a 64k-row space read 4,561 heap pages that way instead of all 109k pages
+       holding the word's 171k matches (0.06 s against 0.33 s warm). A rare
+       word costs about 0.05 s more, the price of the space bitmap.
     """
     enough = need if enough is None else max(1, min(enough, need))
     if tsquery_function not in {"plainto_tsquery", "websearch_to_tsquery"}:
@@ -472,12 +476,23 @@ async def newest_text_match_ids(
     if rows is None or len(ids) >= enough or floor <= lower_id:
         return ids[:need]
     outer_where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    spaced = bool(scope.get("space")) and not scope.get("all_spaces")
     await conn.execute("SELECT set_config('enable_seqscan', 'off', true)")
+    if spaced:
+        await conn.execute("SELECT set_config('enable_indexscan', 'off', true)")
     try:
-        rows = await budget.fetch(
-            conn,
-            "text_older",
-            f"""
+        if spaced:
+            sql = f"""
+            SELECT id
+            FROM agent_memory_events
+            WHERE {" AND ".join(conditions)}
+              AND search_vector @@ {tsquery_function}('english', $1)
+              AND (id + 0) > $2 AND (id + 0) <= $3
+            ORDER BY id DESC
+            LIMIT $4
+            """
+        else:
+            sql = f"""
             SELECT m.id
             FROM (
                 SELECT id, space, agent, event_type, memory_kind, tags, created_at
@@ -489,11 +504,12 @@ async def newest_text_match_ids(
             {outer_where}
             ORDER BY m.id DESC
             LIMIT $4
-            """,
-            query, lower_id, floor, need - len(ids), *values,
-        )
+            """
+        rows = await budget.fetch(conn, "text_older", sql, query, lower_id, floor, need - len(ids), *values)
     finally:
         await conn.execute("SELECT set_config('enable_seqscan', 'on', true)")
+        if spaced:
+            await conn.execute("SELECT set_config('enable_indexscan', 'on', true)")
     ids.extend(int(row["id"]) for row in rows or [])
     return ids[:need]
 
@@ -694,7 +710,152 @@ async def _ensure_autovacuum_options(conn: asyncpg.Connection, table: str) -> No
         await conn.execute(f"ALTER TABLE {table} SET ({', '.join(missing)})")
 
 
-async def init_db_async() -> dict[str, Any]:
+async def _ensure_index_concurrently(conn: asyncpg.Connection, name: str, ddl: str) -> None:
+    """Build an index without blocking writes, replacing a leftover invalid build.
+
+    An interrupted CREATE INDEX CONCURRENTLY (lock timeout behind a long
+    transaction such as the nightly pg_dump) leaves an invalid index that
+    every insert still maintains but no query uses; IF NOT EXISTS would keep it.
+    """
+    valid = await conn.fetchval(
+        "SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass($1)", "public." + name
+    )
+    if valid:
+        return
+    if valid is False:
+        await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
+    await conn.execute(ddl)
+
+
+SPACE_COUNT_TRIGGERS = ("agent_memory_events_count_insert_trg", "agent_memory_events_count_mutation_trg")
+
+
+async def space_counts_maintained(conn: asyncpg.Connection) -> bool:
+    """True when agent_memory_space_search_state.event_count is kept exact by its row triggers."""
+    return bool(
+        await conn.fetchval(
+            """
+            SELECT EXISTS (
+                       SELECT 1 FROM pg_attribute
+                       WHERE attrelid = to_regclass('public.agent_memory_space_search_state')
+                         AND attname = 'event_count' AND NOT attisdropped)
+               AND (SELECT count(*) FROM pg_trigger
+                    WHERE tgrelid = to_regclass('public.agent_memory_events')
+                      AND tgname = ANY($1::text[]) AND NOT tgisinternal) = 2
+            """,
+            list(SPACE_COUNT_TRIGGERS),
+        )
+    )
+
+
+async def ensure_space_counts_async(conn: asyncpg.Connection, *, recount: bool = False) -> dict[str, Any]:
+    """Keep an exact event count per space in agent_memory_space_search_state.
+
+    Listing spaces counted every row of the events table (a 2.2 GB seq scan,
+    2.2-4.8 s). Row triggers now keep the count on the per-space row that the
+    search-cache triggers already update in the same transaction. They have
+    their own functions, so an older client's init, which replaces the cache
+    trigger functions, cannot stop the counting.
+
+    The first run (or --recount-spaces) counts every space under a SHARE lock
+    on the events table, in the same transaction that installs the triggers:
+    no insert can land between the count and the triggers, so the counts are
+    exact. Inserts wait for the count (about 2-3 s at 1.5M rows; hooks have
+    a 3 s lock timeout and retry), reads do not.
+    """
+    if not recount and await space_counts_maintained(conn):
+        return {"space_counts": "maintained", "recounted": False}
+    started = time.monotonic()
+    async with conn.transaction():
+        await conn.execute("LOCK TABLE agent_memory_events IN SHARE MODE")
+        await conn.execute("ALTER TABLE agent_memory_space_search_state ADD COLUMN IF NOT EXISTS event_count BIGINT")
+        await conn.execute(
+            """
+            CREATE OR REPLACE FUNCTION agent_memory_space_count_insert()
+            RETURNS TRIGGER
+            LANGUAGE plpgsql
+            AS $$
+            BEGIN
+                INSERT INTO agent_memory_space_search_state AS state (space, event_count, updated_at)
+                VALUES (NEW.space, 1, NOW())
+                ON CONFLICT (space) DO UPDATE SET event_count = state.event_count + 1;
+                RETURN NULL;
+            END;
+            $$
+            """
+        )
+        await conn.execute(
+            """
+            CREATE OR REPLACE FUNCTION agent_memory_space_count_mutation()
+            RETURNS TRIGGER
+            LANGUAGE plpgsql
+            AS $$
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    UPDATE agent_memory_space_search_state SET event_count = event_count - 1
+                    WHERE space = OLD.space;
+                ELSIF OLD.space IS DISTINCT FROM NEW.space THEN
+                    -- Lower space name first, the order agent_memory_space_search_mutation()
+                    -- locks in, so two opposite moves cannot deadlock.
+                    IF OLD.space < NEW.space THEN
+                        UPDATE agent_memory_space_search_state SET event_count = event_count - 1
+                        WHERE space = OLD.space;
+                    END IF;
+                    INSERT INTO agent_memory_space_search_state AS state (space, event_count, updated_at)
+                    VALUES (NEW.space, 1, NOW())
+                    ON CONFLICT (space) DO UPDATE SET event_count = state.event_count + 1;
+                    IF OLD.space > NEW.space THEN
+                        UPDATE agent_memory_space_search_state SET event_count = event_count - 1
+                        WHERE space = OLD.space;
+                    END IF;
+                END IF;
+                RETURN NULL;
+            END;
+            $$
+            """
+        )
+        # "count" sorts before "scope" and "search", so these triggers lock the
+        # space row first, as the cache triggers do.
+        await conn.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_trigger
+                    WHERE tgname = 'agent_memory_events_count_insert_trg'
+                      AND tgrelid = 'agent_memory_events'::regclass AND NOT tgisinternal
+                ) THEN
+                    CREATE TRIGGER agent_memory_events_count_insert_trg
+                    AFTER INSERT ON agent_memory_events
+                    FOR EACH ROW
+                    EXECUTE FUNCTION agent_memory_space_count_insert();
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_trigger
+                    WHERE tgname = 'agent_memory_events_count_mutation_trg'
+                      AND tgrelid = 'agent_memory_events'::regclass AND NOT tgisinternal
+                ) THEN
+                    CREATE TRIGGER agent_memory_events_count_mutation_trg
+                    AFTER DELETE OR UPDATE OF space ON agent_memory_events
+                    FOR EACH ROW
+                    EXECUTE FUNCTION agent_memory_space_count_mutation();
+                END IF;
+            END;
+            $$
+            """
+        )
+        await conn.execute("UPDATE agent_memory_space_search_state SET event_count = 0")
+        await conn.execute(
+            """
+            INSERT INTO agent_memory_space_search_state AS state (space, event_count, updated_at)
+            SELECT space, count(*), NOW() FROM agent_memory_events GROUP BY space
+            ON CONFLICT (space) DO UPDATE SET event_count = EXCLUDED.event_count
+            """
+        )
+    return {"space_counts": "maintained", "recounted": True, "locked_ms": round((time.monotonic() - started) * 1000)}
+
+
+async def init_db_async(*, recount_spaces: bool = False) -> dict[str, Any]:
     conn = await connect()
     try:
         # Every DDL below waits for a table lock, and hook inserts queue behind
@@ -966,6 +1127,7 @@ async def init_db_async() -> dict[str, Any]:
                 $$
                 """
             )
+        space_counts = await ensure_space_counts_async(conn, recount=recount_spaces)
         await _execute_ddl(
             conn,
             """
@@ -1137,7 +1299,14 @@ async def init_db_async() -> dict[str, Any]:
             ON agent_memory_events USING GIN ((metadata->'identity'))
             WHERE metadata ? 'identity'
         """)
-        return {"ok": True, "message": "agent_memory_events schema ready", "driver": "asyncpg"}
+        # audit --session-id walked created_at backwards and dropped 1.29M rows
+        # to find an old session's 20 (1.1 s warm, 57 s after a cache reclaim).
+        await _ensure_index_concurrently(conn, "agent_memory_events_session_created_idx", """
+            CREATE INDEX CONCURRENTLY agent_memory_events_session_created_idx
+            ON agent_memory_events (session_id, created_at DESC)
+            WHERE session_id IS NOT NULL
+        """)
+        return {"ok": True, "message": "agent_memory_events schema ready", "driver": "asyncpg", **space_counts}
     finally:
         await conn.close()
 
@@ -3108,20 +3277,36 @@ async def audit_events_async(
         idx += 1
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
     params.append(limit)
+    sql = f"""
+        SELECT id, created_at, space, session_id, agent, event_type, memory_kind, role, source,
+               summary, tags, metadata - 'raw_payload' AS metadata, left(content, 2400) AS content
+        FROM agent_memory_events
+        {where}
+        ORDER BY created_at DESC
+        LIMIT ${idx}
+        """
 
     conn = await connect()
     try:
-        rows = await conn.fetch(
-            f"""
-            SELECT id, created_at, space, session_id, agent, event_type, memory_kind, role, source,
-                   summary, tags, metadata - 'raw_payload' AS metadata, left(content, 2400) AS content
-            FROM agent_memory_events
-            {where}
-            ORDER BY created_at DESC
-            LIMIT ${idx}
-            """,
-            *params,
-        )
+        if identity_filter:
+            # The identity GIN has no statistics for @>, so the planner always
+            # guesses about 1,200 matches. For harness=claude_code (465k rows)
+            # that bitmap read every match to sort them: 17.6 s. Walking
+            # created_at backwards finds a common identity's newest rows in
+            # about 1 ms, so try that first under a short timeout, and fall back
+            # to the GIN bitmap, which is fast exactly when the walk is not.
+            walk_ms = env_int("AGENT_MEMORY_AUDIT_WALK_MS", 500, minimum=50, maximum=60000)
+            try:
+                async with conn.transaction():
+                    await conn.execute(
+                        "SELECT set_config('enable_bitmapscan', 'off', true), set_config('statement_timeout', $1, true)",
+                        str(walk_ms),
+                    )
+                    rows = await conn.fetch(sql, *params)
+                return [dict(row) for row in rows]
+            except asyncpg.QueryCanceledError:
+                pass
+        rows = await conn.fetch(sql, *params)
         return [dict(row) for row in rows]
     finally:
         await conn.close()
@@ -3259,6 +3444,7 @@ async def status_async(*, details: bool = False) -> dict[str, Any]:
                 result["search_cache"]["scope"] = "global"
         else:
             result["search_cache"] = {"available": False}
+        result["space_counts"] = "maintained" if await space_counts_maintained(conn) else "counted per listing"
         if details:
             breakdown_rows = await conn.fetch(
                 """
@@ -3287,15 +3473,27 @@ async def status_async(*, details: bool = False) -> dict[str, Any]:
 async def list_spaces_async() -> list[dict[str, Any]]:
     conn = await connect()
     try:
-        rows = await conn.fetch(
-            """
-            SELECT s.*, count(e.id) AS event_count
-            FROM agent_memory_spaces s
-            LEFT JOIN agent_memory_events e ON e.space = s.space
-            GROUP BY s.space, s.description, s.parent_space, s.metadata, s.created_at, s.updated_at
-            ORDER BY s.updated_at DESC, s.space
-            """
-        )
+        if await space_counts_maintained(conn):
+            # Exact counts kept by row triggers (ensure_space_counts_async);
+            # counting the events table instead was a 2.2 GB seq scan.
+            rows = await conn.fetch(
+                """
+                SELECT s.*, COALESCE(c.event_count, 0)::BIGINT AS event_count
+                FROM agent_memory_spaces s
+                LEFT JOIN agent_memory_space_search_state c ON c.space = s.space
+                ORDER BY s.updated_at DESC, s.space
+                """
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT s.*, count(e.id) AS event_count
+                FROM agent_memory_spaces s
+                LEFT JOIN agent_memory_events e ON e.space = s.space
+                GROUP BY s.space, s.description, s.parent_space, s.metadata, s.created_at, s.updated_at
+                ORDER BY s.updated_at DESC, s.space
+                """
+            )
         return [dict(row) for row in rows]
     finally:
         await conn.close()
@@ -3624,7 +3822,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="Emit JSON")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("init", help="Initialize schema")
+    init_parser = sub.add_parser("init", help="Initialize schema")
+    init_parser.add_argument(
+        "--recount-spaces", action="store_true",
+        help="Recount every space's events under a short SHARE lock (inserts wait about 2-3 s)",
+    )
     status_parser = sub.add_parser("status", help="Show bounded memory status")
     status_parser.add_argument("--details", action="store_true", help="Compute exact counts, archive sizes, and all space/agent breakdowns (may be slow)")
     sub.add_parser("self-test", help="Test inserts/search/isolation on an initialized schema (no DDL)")
@@ -3776,7 +3978,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def run_cli(args: argparse.Namespace) -> int:
     if args.command == "init":
-        print_result(await init_db_async(), args.json)
+        print_result(await init_db_async(recount_spaces=args.recount_spaces), args.json)
     elif args.command == "status":
         print_result(await status_async(details=args.details), args.json)
     elif args.command == "self-test":

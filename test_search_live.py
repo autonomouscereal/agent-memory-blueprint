@@ -174,5 +174,94 @@ class LiveSearchCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Broken pipe", rows[0]["content"])
 
 
+async def space_counts(*spaces):
+    conn = await agent_memory.connect()
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT s.space, s.event_count, (SELECT count(*) FROM agent_memory_events e WHERE e.space = s.space) AS actual
+            FROM agent_memory_space_search_state s WHERE s.space = ANY($1::text[])
+            """,
+            list(spaces),
+        )
+    finally:
+        await conn.close()
+    return {row["space"]: (row["event_count"], row["actual"]) for row in rows}
+
+
+@unittest.skipUnless(LIVE, "set AGENT_MEMORY_LIVE_TESTS=1 and point MEMORY_DB_* at a throwaway database")
+class LiveSpaceCountTests(unittest.IsolatedAsyncioTestCase):
+    """Per-space event counts kept by row triggers (spaces listing without a table scan)."""
+
+    @classmethod
+    def setUpClass(cls):
+        asyncio.run(agent_memory.init_db_async())
+
+    def setUp(self):
+        run = uuid.uuid4().hex[:10]
+        self.space_a = f"live-test/{run}/count-a"
+        self.space_b = f"live-test/{run}/count-b"
+        self.marker = f"countcorn{run}"
+
+    async def test_inserts_upserts_moves_and_deletes_keep_exact_counts(self):
+        for n in range(3):
+            await add(self.space_a, f"{self.marker} a{n}")
+        await add(self.space_b, f"{self.marker} b0")
+        self.assertEqual(await space_counts(self.space_a, self.space_b), {self.space_a: (3, 3), self.space_b: (1, 1)})
+        # The same uid again is an update in place: no new row, no count change.
+        uid = f"{self.marker}-fixed"
+        await add(self.space_a, f"{self.marker} fixed", event_uid=uid)
+        await add(self.space_a, f"{self.marker} fixed, edited", event_uid=uid)
+        self.assertEqual((await space_counts(self.space_a))[self.space_a], (4, 4))
+        # The upsert moves a row when the new space is not global.
+        await add(self.space_b, f"{self.marker} fixed, moved", event_uid=uid)
+        self.assertEqual(await space_counts(self.space_a, self.space_b), {self.space_a: (3, 3), self.space_b: (2, 2)})
+        conn = await agent_memory.connect()
+        try:
+            await conn.execute("DELETE FROM agent_memory_events WHERE event_uid = $1", uid)
+            # Both directions of a move, in one statement each.
+            await conn.execute("UPDATE agent_memory_events SET space = $2 WHERE space = $1", self.space_b, self.space_a)
+            await conn.execute(
+                "UPDATE agent_memory_events SET space = $2 WHERE id = (SELECT min(id) FROM agent_memory_events WHERE space = $1)",
+                self.space_a, self.space_b,
+            )
+        finally:
+            await conn.close()
+        self.assertEqual(await space_counts(self.space_a, self.space_b), {self.space_a: (3, 3), self.space_b: (1, 1)})
+
+    async def test_concurrent_writers_and_listing(self):
+        await asyncio.gather(*(add(self.space_a if n % 2 else self.space_b, f"{self.marker} p{n}") for n in range(30)))
+        self.assertEqual(await space_counts(self.space_a, self.space_b), {self.space_a: (15, 15), self.space_b: (15, 15)})
+        listed = {row["space"]: row["event_count"] for row in await agent_memory.list_spaces_async()}
+        self.assertEqual((listed[self.space_a], listed[self.space_b]), (15, 15))
+
+    async def test_recount_matches_the_table(self):
+        await add(self.space_a, f"{self.marker} before recount")
+        conn = await agent_memory.connect()
+        try:
+            # Simulate drift, then recount under the lock.
+            await conn.execute("UPDATE agent_memory_space_search_state SET event_count = 999 WHERE space = $1", self.space_a)
+            result = await agent_memory.ensure_space_counts_async(conn, recount=True)
+            maintained = await agent_memory.space_counts_maintained(conn)
+        finally:
+            await conn.close()
+        self.assertTrue(result["recounted"])
+        self.assertTrue(maintained)
+        self.assertEqual((await space_counts(self.space_a))[self.space_a], (1, 1))
+
+    async def test_identity_audit_finds_newest_rows(self):
+        harness = f"live-harness-{self.marker}"
+        for n in range(3):
+            await add(self.space_a, f"{self.marker} identity {n}", metadata={"identity": {"harness": harness}})
+        rows = await agent_memory.audit_events_async(limit=2, harness=harness, all_spaces=True)
+        self.assertEqual([row["content"] for row in rows], [f"{self.marker} identity 2", f"{self.marker} identity 1"])
+        os.environ["AGENT_MEMORY_AUDIT_WALK_MS"] = "50"
+        try:
+            rows = await agent_memory.audit_events_async(limit=5, harness=harness, all_spaces=True)
+        finally:
+            os.environ.pop("AGENT_MEMORY_AUDIT_WALK_MS", None)
+        self.assertEqual(len(rows), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
