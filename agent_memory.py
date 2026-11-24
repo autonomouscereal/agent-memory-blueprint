@@ -10,6 +10,25 @@ Design constraints:
 
 from __future__ import annotations
 
+import os
+import sys
+
+if __name__ == "__main__" and sys.dont_write_bytecode and os.environ.get("AGENT_MEMORY_PYCACHE", "1") != "0":
+    # Containers often run Python with PYTHONDONTWRITEBYTECODE=1 and a standard
+    # library without .pyc files, so every CLI call compiled asyncio, typing,
+    # inspect and the rest from source: 0.65 s of the Sprite node's 1.4 s
+    # call. Run as a script, the CLI keeps its own bytecode cache beside this
+    # file (Python then reads and writes .pyc only there); set
+    # AGENT_MEMORY_PYCACHE=0 to opt out. Imported as a module, nothing changes.
+    _pycache = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pycache")
+    try:
+        os.makedirs(_pycache, exist_ok=True)
+        if os.access(_pycache, os.W_OK):
+            sys.pycache_prefix = _pycache
+            sys.dont_write_bytecode = False
+    except OSError:
+        pass  # A read-only install runs uncached, as before.
+
 import argparse
 import asyncio
 import csv
@@ -17,12 +36,10 @@ import hashlib
 import json
 import math
 import mimetypes
-import os
 import re
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import wave

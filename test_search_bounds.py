@@ -108,6 +108,40 @@ def base_rules(max_id=1000, cache_row=None, state=None, text_recent=(), text_old
     return rules
 
 
+class ScriptBytecodeCacheTests(unittest.TestCase):
+    """Run as a script under PYTHONDONTWRITEBYTECODE=1, the CLI caches bytecode in .pycache beside itself."""
+
+    def run_help(self, folder, **env_extra):
+        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "AGENT_MEMORY_ENV_FILE": str(Path(folder) / "no.env"),
+               **env_extra}
+        return subprocess.run([sys.executable, str(Path(folder) / "agent_memory.py"), "--help"], capture_output=True,
+                              text=True, env=env, timeout=120, check=True)
+
+    def test_script_run_writes_and_reuses_its_own_cache(self):
+        import shutil
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            shutil.copyfile(agent_memory.__file__, Path(folder) / "agent_memory.py")
+            self.assertIn("grep", self.run_help(folder).stdout)
+            cached = [p.name for p in (Path(folder) / ".pycache").rglob("*.pyc")]
+            self.assertTrue(any(name.startswith("asyncio") or name.startswith("base_events") for name in cached), cached[:10])
+            self.assertTrue(any(name.startswith("asyncpg") or name.startswith("connection.") for name in cached), cached[:10])
+            before = {p: p.stat().st_mtime_ns for p in (Path(folder) / ".pycache").rglob("*.pyc")}
+            self.run_help(folder)
+            after = {p: p.stat().st_mtime_ns for p in (Path(folder) / ".pycache").rglob("*.pyc")}
+            self.assertEqual(before, after, "the second run must read the cache, not rewrite it")
+
+    def test_opt_out_and_module_import_leave_bytecode_alone(self):
+        import shutil
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            shutil.copyfile(agent_memory.__file__, Path(folder) / "agent_memory.py")
+            self.run_help(folder, AGENT_MEMORY_PYCACHE="0")
+            self.assertFalse((Path(folder) / ".pycache").exists())
+        # This test process imported agent_memory as a module: no prefix was set.
+        self.assertIsNone(sys.pycache_prefix)
+
+
 class StemTokenTests(unittest.TestCase):
     def test_variants_keep_a_stable_order(self):
         self.assertEqual(agent_memory.stem_token("Hermes"), ["hermes", "herme"])
