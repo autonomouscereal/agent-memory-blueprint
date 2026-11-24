@@ -24,6 +24,8 @@
 !test_self_test.py
 !test_connection_cleanup.py
 !test_spool_writer.py
+!test_search_bounds.py
+!test_search_live.py
 
 !docs/
 !docs/*.md

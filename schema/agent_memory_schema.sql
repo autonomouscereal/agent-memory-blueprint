@@ -81,6 +81,60 @@ CREATE FUNCTION public.agent_memory_bump_search_revision() RETURNS trigger
             $$;
 
 
+--
+-- Name: agent_memory_space_search_insert(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.agent_memory_space_search_insert() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+                BEGIN
+                    INSERT INTO agent_memory_space_search_state AS state (space, inserted_rows, updated_at)
+                    VALUES (NEW.space, 1, NOW())
+                    ON CONFLICT (space) DO UPDATE SET
+                        inserted_rows = state.inserted_rows + 1,
+                        updated_at = NOW();
+                    RETURN NULL;
+                END;
+                $$;
+
+
+--
+-- Name: agent_memory_space_search_mutation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.agent_memory_space_search_mutation() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+                DECLARE
+                    first_space TEXT;
+                    second_space TEXT;
+                BEGIN
+                    -- A row moved between spaces changes both. Lock them in
+                    -- name order so two opposite moves cannot deadlock.
+                    IF TG_OP = 'UPDATE' THEN
+                        first_space := LEAST(OLD.space, NEW.space);
+                        second_space := NULLIF(GREATEST(OLD.space, NEW.space), first_space);
+                    ELSE
+                        first_space := OLD.space;
+                    END IF;
+                    INSERT INTO agent_memory_space_search_state AS state (space, mutation_revision, updated_at)
+                    VALUES (first_space, 1, NOW())
+                    ON CONFLICT (space) DO UPDATE SET
+                        mutation_revision = state.mutation_revision + 1,
+                        updated_at = NOW();
+                    IF second_space IS NOT NULL THEN
+                        INSERT INTO agent_memory_space_search_state AS state (space, mutation_revision, updated_at)
+                        VALUES (second_space, 1, NOW())
+                        ON CONFLICT (space) DO UPDATE SET
+                            mutation_revision = state.mutation_revision + 1,
+                            updated_at = NOW();
+                    END IF;
+                    RETURN NULL;
+                END;
+                $$;
+
+
 SET default_tablespace = '';
 
 SET default_table_access_method = heap;
@@ -223,7 +277,8 @@ CREATE TABLE public.agent_memory_events (
     metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
     embedding public.vector(384),
     search_vector tsvector GENERATED ALWAYS AS (to_tsvector('english'::regconfig, ((COALESCE(content, ''::text) || ' '::text) || COALESCE(summary, ''::text)))) STORED
-);
+)
+WITH (autovacuum_vacuum_insert_scale_factor='0.01', autovacuum_analyze_scale_factor='0.01', autovacuum_vacuum_scale_factor='0.02');
 
 
 --
@@ -268,7 +323,8 @@ CREATE TABLE public.agent_memory_payload_archives (
     payload bytea NOT NULL,
     metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
-);
+)
+WITH (autovacuum_vacuum_insert_scale_factor='0.01', autovacuum_analyze_scale_factor='0.01', autovacuum_vacuum_scale_factor='0.02');
 
 
 --
@@ -318,6 +374,18 @@ CREATE TABLE public.agent_memory_search_state (
     mutation_revision bigint DEFAULT 0 NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT agent_memory_search_state_singleton_check CHECK (singleton)
+);
+
+
+--
+-- Name: agent_memory_space_search_state; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.agent_memory_space_search_state (
+    space text NOT NULL,
+    inserted_rows bigint DEFAULT 0 NOT NULL,
+    mutation_revision bigint DEFAULT 0 NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -448,6 +516,14 @@ ALTER TABLE ONLY public.agent_memory_search_cache
 
 ALTER TABLE ONLY public.agent_memory_search_state
     ADD CONSTRAINT agent_memory_search_state_pkey PRIMARY KEY (singleton);
+
+
+--
+-- Name: agent_memory_space_search_state agent_memory_space_search_state_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.agent_memory_space_search_state
+    ADD CONSTRAINT agent_memory_space_search_state_pkey PRIMARY KEY (space);
 
 
 --
@@ -596,6 +672,20 @@ CREATE INDEX agent_memory_payload_archives_space_idx ON public.agent_memory_payl
 --
 
 CREATE INDEX agent_memory_search_cache_accessed_idx ON public.agent_memory_search_cache USING btree (last_accessed_at DESC);
+
+
+--
+-- Name: agent_memory_events agent_memory_events_scope_insert_trg; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER agent_memory_events_scope_insert_trg AFTER INSERT ON public.agent_memory_events FOR EACH ROW EXECUTE FUNCTION public.agent_memory_space_search_insert();
+
+
+--
+-- Name: agent_memory_events agent_memory_events_scope_mutation_trg; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER agent_memory_events_scope_mutation_trg AFTER DELETE OR UPDATE ON public.agent_memory_events FOR EACH ROW EXECUTE FUNCTION public.agent_memory_space_search_mutation();
 
 
 --

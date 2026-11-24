@@ -24,6 +24,7 @@ class StatusTests(unittest.IsolatedAsyncioTestCase):
         connection.fetchrow.side_effect = [
             {"newest": "2026-10-18", "oldest": "2026-05-12"},
             {"revision": 7, "mutation_revision": 2, "entries": 3, "hits": 9, "last_accessed_at": None},
+            {"tracked_spaces": 4, "inserted_rows": 120, "space_mutations": 1},
         ]
         with patch.object(agent_memory, "connect", AsyncMock(return_value=connection)):
             result = await agent_memory.status_async()
@@ -34,6 +35,10 @@ class StatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["count_accuracy"], "estimated")
         self.assertEqual(result["count_source"], "pg_stat_user_tables.n_live_tup or pg_class.reltuples")
         self.assertEqual(result["search_cache"]["revision"], 7)
+        # Per-space cache counters come from their own small table.
+        self.assertEqual(result["search_cache"]["scope"], "space")
+        self.assertEqual(result["search_cache"]["tracked_spaces"], 4)
+        self.assertEqual(result["search_cache"]["inserted_rows"], 120)
         self.assertIsNone(result["graph"]["payload_archive_raw_chars"])
         self.assertIsNone(result["graph"]["payload_archive_compressed_bytes"])
         self.assertEqual(set(result["omitted_fields"]), {
@@ -65,7 +70,7 @@ class StatusTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_details_preserves_exact_aggregates_and_breakdowns(self):
         connection = AsyncMock()
-        connection.fetchval.side_effect = [42, 2, True]
+        connection.fetchval.side_effect = [42, 2, True, False]
         connection.fetch.side_effect = [
             [{"space": "workspace/example", "events": 42}],
             [{"space": "workspace/example", "agent": "Codex", "event_type": "note", "count": 42}],
@@ -91,6 +96,8 @@ class StatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["top_spaces"][0]["events"], 42)
         self.assertEqual(result["spaces"][0]["events"], 42)
         self.assertEqual(result["breakdown"][0]["count"], 42)
+        # A database that has not run the new init yet reports the old global scope.
+        self.assertEqual(result["search_cache"]["scope"], "global")
         sql = " ".join(call.args[0] for call in connection.mock_calls if call.args)
         self.assertIn("SELECT count(*) AS total FROM agent_memory_events", sql)
         self.assertIn("sum(raw_chars)", sql)

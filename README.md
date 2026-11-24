@@ -184,6 +184,11 @@ hook's working directory, so a project's own `.env` can't redirect memory.
 | `AGENT_MEMORY_SPACE` | | Pin everything to one space. Set it per launcher, not in `.env`. |
 | `AGENT_MEMORY_MIN_SEARCH_SCORE` | `0.18` | Score floor for `search`. |
 | `AGENT_MEMORY_SEARCH_CACHE` | `1` | `0` turns off the result cache (diagnostics only). |
+| `AGENT_MEMORY_SEARCH_TIMEOUT_MS` / `_LEG_TIMEOUT_MS` | `15000` / `5000` | Whole search, and each candidate query inside it; a query that runs out is skipped. |
+| `AGENT_MEMORY_SEARCH_TEXT_POOL` / `_RECENT_WINDOW` | `1000` / `20000` | Newest full-text matches ranked, and the newest-id window read first. |
+| `AGENT_MEMORY_SEARCH_VECTOR` | `1` | `0` skips the vector candidates. |
+| `AGENT_MEMORY_GREP_SLICE_ROWS` | `20000` | Id slice size for `grep --contains`. |
+| `AGENT_MEMORY_SEARCH_DEBUG` | `0` | `1` prints each candidate query's time to stderr. |
 | `AGENT_MEMORY_HOOK_CONNECT_TIMEOUT` | `4` | Seconds per connect attempt (2 attempts). |
 | `AGENT_MEMORY_HOOK_STATEMENT_TIMEOUT_MS` / `_LOCK_TIMEOUT_MS` | `15000` / `3000` | Hook SQL bounds. |
 | `AGENT_MEMORY_HOOK_MAX_CONTENT_CHARS` | `60000` | Searchable text kept per hook event; the archive keeps everything. |

@@ -16,6 +16,7 @@ through `asyncpg`. `agent_memory.py init` creates and migrates the schema;
 | `agent_memory_entities`, `_entity_mentions`, `_entity_edges` | A small entity graph. Explicit notes and document chunks populate it; high-volume hook events deliberately do not. |
 | `agent_memory_event_links` | Explicit links between events. |
 | `agent_memory_search_state`, `agent_memory_search_cache` | Revision counters maintained by triggers, plus cached result sets for repeated queries. |
+| `agent_memory_space_search_state` | Per-space insert and mutation counters, kept by row triggers on `agent_memory_events`. Cache entries are validated against these, so one space's writes leave other spaces' cached searches valid. |
 
 Indexes: HNSW on `embedding` (cosine), GIN on `search_vector`, GIN trigram on
 `content`, GIN on `tags`, B-tree on `(space, created_at)` and friends, and a
@@ -57,24 +58,52 @@ lifecycle event. It reads the hook JSON from stdin.
 
 `search` runs in two stages so it stays fast at a million-plus rows:
 
-1. **Candidates.** A bounded pool (default 400) from the HNSW nearest-neighbour
-   index plus a bounded pool from full-text search, filtered by space, agent,
-   event type, kind and tags. Filtered HNSW uses pgvector's iterative scan when
-   available.
+1. **Candidates.** Each source is a separate query with its own statement
+   timeout. A source that runs out of time is skipped, and the search answers
+   from the others; such an answer is not cached.
+   - Full text: the newest 1,000 matches, then the best 400 of those by
+     `ts_rank_cd`. Ranking every match is what used to time out: a common word
+     matches 170k+ rows, and ranking reads each row's TOASTed `tsvector`. The
+     newest matches come from the newest 20k ids first (a backward primary-key
+     walk that stops early); older rows are read through the GIN index alone
+     only when that window holds fewer than 400.
+   - Vector: up to 400 HNSW nearest neighbours, filtered by space, agent,
+     event type, kind and tags, with pgvector's relaxed iterative scan and a
+     tuple cap for filtered scans.
 2. **Rerank.** `0.68 x vector similarity + 0.22 x ts_rank_cd + 0.10 x trigram
    similarity`, plus a fixed bonus when every query term matches, so long
-   documents are not buried by normalized ranks. Results under 0.18 are dropped,
-   and identifier-like queries need lexical or trigram evidence, so a random
-   vector neighbour can't pose as a match.
+   documents are not buried by normalized ranks. Trigram similarity over a
+   whole document is the costly part, and it adds at most 0.10, so it is only
+   computed for candidates within 0.10 of the top results on the other parts.
+   Results under 0.18 are dropped, and identifier-like queries need lexical or
+   trigram evidence, so a random vector neighbour can't pose as a match.
+
+Search runs with `work_mem` 64 MB (exact GIN bitmaps need no recheck), no
+parallel workers (a 64 MB container `/dev/shm` can't hold a parallel bitmap
+that size) and no JIT.
 
 Embeddings are computed once at write time and stored; search never re-embeds
-the corpus. Repeated queries hit `agent_memory_search_cache`. Triggers bump an
-append revision on insert and a mutation revision on update/delete. If only new
-rows arrived, the cache scores just the new ID range and merges it in.
-Anything else forces a full indexed refresh.
+the corpus. Repeated queries hit `agent_memory_search_cache`. Row triggers
+count inserts and updates/deletes per space in `agent_memory_space_search_state`.
+A cache entry stores its space's counts (summed over all spaces for
+`--all-spaces`) and the newest id it saw:
 
-`grep` is the audit tool: indexed full-text or trigram substring search, with
-no vector scoring. Use it for exact error strings, IDs and paths.
+- counts unchanged: the cached result is returned as is, whatever other spaces
+  wrote;
+- only inserts, at most 5,000 of them, all above the stored id (checked by
+  counting): the same candidate search runs over just that id range and is
+  merged in;
+- anything else (an update, a delete, a larger or out-of-order delta): a full
+  search.
+
+The global `agent_memory_search_state` revision is still maintained for older
+clients; new code does not read it.
+
+`grep` is the audit tool, with no vector scoring. Full-text mode ranks the
+newest matches the same way search does. `--contains` (ILIKE) walks 20k-id
+slices from the newest and stops when it has enough matches or its budget runs
+out; it prints a note on stderr when the budget ran out first. Use it for exact
+error strings, IDs and paths.
 
 `trace --event-id N` hydrates the full archived payload for a search hit and
 verifies its SHA-256, character count and byte count on the way out.

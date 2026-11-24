@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import wave
 import zipfile
 import zlib
@@ -68,7 +69,10 @@ load_local_env(Path(os.getenv("AGENT_MEMORY_ENV_FILE") or BACKEND_DIR / ".env"))
 VECTOR_DIMS = 384
 DEFAULT_SEARCH_CANDIDATES = 400
 MAX_SEARCH_CANDIDATES = 2000
-SEARCH_CACHE_VERSION = "hybrid-v2-strict"
+# v3: cache entries are validated against per-space counters
+# (agent_memory_space_search_state), not the global revision. Older clients
+# keep reading their own v2 keys, so the two never mix.
+SEARCH_CACHE_VERSION = "hybrid-v3-space"
 DEFAULT_MIN_SEARCH_SCORE = float(os.getenv("AGENT_MEMORY_MIN_SEARCH_SCORE", "0.18"))
 MAX_INDEXED_CONTENT_CHARS = max(10000, int(os.getenv("AGENT_MEMORY_MAX_INDEXED_CONTENT_CHARS", "180000")))
 DEFAULT_SPACE = os.getenv("AGENT_MEMORY_SPACE", "global").strip() or "global"
@@ -227,14 +231,16 @@ ENTITY_RE = re.compile(
 
 def stem_token(token: str) -> list[str]:
     token = token.lower()
-    variants = {token}
+    variants = [token]
     for suffix in ("ingly", "edly", "ing", "ed", "ies", "s"):
         if len(token) > len(suffix) + 3 and token.endswith(suffix):
-            if suffix == "ies":
-                variants.add(token[: -len(suffix)] + "y")
-            else:
-                variants.add(token[: -len(suffix)])
-    return list(variants)
+            stem = token[: -len(suffix)] + ("y" if suffix == "ies" else "")
+            if stem not in variants:
+                variants.append(stem)
+    # A list, not a set: set order follows each process's hash seed, so the
+    # bigram features, and with them the query vector and its top hits,
+    # changed from one run to the next.
+    return variants
 
 
 def stable_hash(text: str, salt: str = "") -> int:
@@ -298,6 +304,246 @@ def search_candidate_limit(limit: int) -> int:
 
 def search_cache_enabled() -> bool:
     return os.getenv("AGENT_MEMORY_SEARCH_CACHE", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def env_flag(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def scope_filters(
+    start: int,
+    *,
+    space: str = "",
+    all_spaces: bool = False,
+    agent: str = "",
+    event_type: str = "",
+    memory_kind: str = "",
+    tags: list[str] | None = None,
+    since: datetime | None = None,
+) -> tuple[list[str], list[Any]]:
+    """SQL conditions and their values for the usual event filters, numbered from $[start].
+
+    Column names are unqualified, so the same conditions work on the events
+    table and on a subquery that selects these columns.
+    """
+    conditions: list[str] = []
+    values: list[Any] = []
+    for column, value in (
+        ("space", normalize_space(space) if space and not all_spaces else ""),
+        ("agent", agent),
+        ("event_type", event_type),
+        ("memory_kind", memory_kind),
+    ):
+        if value:
+            conditions.append(f"{column} = ${start + len(values)}")
+            values.append(value)
+    if tags:
+        conditions.append(f"tags && ${start + len(values)}::TEXT[]")
+        values.append(tags)
+    if since:
+        conditions.append(f"created_at >= ${start + len(values)}")
+        values.append(since)
+    return conditions, values
+
+
+class SearchBudget:
+    """Wall-clock budget for one search or grep, split into per-leg statement timeouts.
+
+    Each leg runs in a savepoint with its own statement_timeout. A leg that
+    runs out of time is recorded and skipped, so the search answers from the
+    legs that finished instead of failing (one unbounded leg used to
+    cancel the whole query).
+    """
+
+    def __init__(self, total_ms: int, leg_ms: int) -> None:
+        self.total_ms = total_ms
+        self.leg_ms = leg_ms
+        self.deadline = time.monotonic() + total_ms / 1000
+        self.legs: list[dict[str, Any]] = []
+
+    def leg_timeout_ms(self) -> int:
+        remaining = int((self.deadline - time.monotonic()) * 1000)
+        return min(self.leg_ms, remaining)
+
+    @property
+    def complete(self) -> bool:
+        return all(leg["status"] == "ok" for leg in self.legs)
+
+    async def fetch(self, conn: asyncpg.Connection, leg: str, sql: str, *args: Any) -> list[Any] | None:
+        timeout_ms = self.leg_timeout_ms()
+        started = time.monotonic()
+        if timeout_ms < 100:
+            self.legs.append({"leg": leg, "status": "no_time", "ms": 0})
+            return None
+        await conn.execute("SELECT set_config('statement_timeout', $1, true)", str(timeout_ms))
+        try:
+            async with conn.transaction():
+                rows = await conn.fetch(sql, *args)
+        except asyncpg.QueryCanceledError:
+            self.legs.append({"leg": leg, "status": "timeout", "ms": round((time.monotonic() - started) * 1000)})
+            return None
+        self.legs.append({"leg": leg, "status": "ok", "ms": round((time.monotonic() - started) * 1000), "rows": len(rows)})
+        return rows
+
+    def report(self, kind: str) -> None:
+        if env_flag("AGENT_MEMORY_SEARCH_DEBUG", False):
+            print(json.dumps({"search_debug": kind, "complete": self.complete, "legs": self.legs}), file=sys.stderr)
+
+
+async def search_session_settings(conn: asyncpg.Connection) -> None:
+    """Transaction-local planner settings for search and grep.
+
+    work_mem keeps the full-text bitmap exact, so GIN matches need no recheck
+    and no search_vector detoast. No parallel workers: the database container
+    has a 64 MB /dev/shm, and a parallel bitmap that size fails there with
+    DiskFullError. JIT costs more to compile than these short queries run.
+    """
+    await conn.execute(
+        """
+        SELECT set_config('work_mem', $1, true),
+               set_config('max_parallel_workers_per_gather', '0', true),
+               set_config('jit', 'off', true)
+        """,
+        os.getenv("AGENT_MEMORY_SEARCH_WORK_MEM", "64MB"),
+    )
+
+
+async def newest_text_match_ids(
+    conn: asyncpg.Connection,
+    budget: SearchBudget,
+    *,
+    tsquery_function: str,
+    query: str,
+    scope: dict[str, Any],
+    need: int,
+    upper_id: int,
+    lower_id: int = 0,
+    window: int,
+    enough: int | None = None,
+) -> list[int]:
+    """Ids of the newest full-text matches in (lower_id, upper_id], at most [need].
+
+    Ranking every match is what made a common word time out: ts_rank_cd reads
+    each match's TOASTed search_vector, and "memory" matches about 170k rows.
+    So this collects the newest matches only, in two bounded passes, and the
+    caller ranks that pool.
+
+    1. The newest [window] ids. The planner can walk the primary key backwards
+       and stop after [need] matches, so it reads at most [window] rows.
+    2. Only when that found fewer than [enough] (default [need]): the older ids
+       through the GIN index alone. OFFSET 0 keeps the scope filters out of the
+       inner scan, and seq scans are off, so no plan filters a large space row
+       by row and detoasts each search_vector; the cost follows the number of
+       matches.
+    """
+    enough = need if enough is None else max(1, min(enough, need))
+    if tsquery_function not in {"plainto_tsquery", "websearch_to_tsquery"}:
+        raise ValueError(f"unsupported tsquery function: {tsquery_function}")
+    ids: list[int] = []
+    floor = max(lower_id, upper_id - window)
+    conditions, values = scope_filters(5, **scope)
+    # Scope conditions come first: PostgreSQL keeps the written order for
+    # equally cheap quals, so a space test runs before the tsvector test.
+    where = " AND ".join([*conditions, "id > $2", "id <= $3", f"search_vector @@ {tsquery_function}('english', $1)"])
+    rows = await budget.fetch(
+        conn,
+        "text_recent",
+        f"""
+        SELECT id
+        FROM agent_memory_events
+        WHERE {where}
+        ORDER BY id DESC
+        LIMIT $4
+        """,
+        query, floor, upper_id, need, *values,
+    )
+    ids.extend(int(row["id"]) for row in rows or [])
+    if rows is None or len(ids) >= enough or floor <= lower_id:
+        return ids[:need]
+    outer_where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    await conn.execute("SELECT set_config('enable_seqscan', 'off', true)")
+    try:
+        rows = await budget.fetch(
+            conn,
+            "text_older",
+            f"""
+            SELECT m.id
+            FROM (
+                SELECT id, space, agent, event_type, memory_kind, tags, created_at
+                FROM agent_memory_events
+                WHERE search_vector @@ {tsquery_function}('english', $1)
+                  AND (id + 0) > $2 AND (id + 0) <= $3
+                OFFSET 0
+            ) m
+            {outer_where}
+            ORDER BY m.id DESC
+            LIMIT $4
+            """,
+            query, lower_id, floor, need - len(ids), *values,
+        )
+    finally:
+        await conn.execute("SELECT set_config('enable_seqscan', 'on', true)")
+    ids.extend(int(row["id"]) for row in rows or [])
+    return ids[:need]
+
+
+async def newest_substring_match_ids(
+    conn: asyncpg.Connection,
+    budget: SearchBudget,
+    *,
+    query: str,
+    scope: dict[str, Any],
+    need: int,
+    upper_id: int,
+    lower_id: int = 0,
+    slice_rows: int | None = None,
+) -> list[int]:
+    """Ids of the newest rows whose content contains [query] (ILIKE), at most [need].
+
+    An ILIKE recheck reads each candidate's whole TOASTed content, and the
+    trigram look-alikes of a rare word are mostly the largest tool outputs:
+    "zygote" has 118 matches among 1,229 candidates, about 3.5 s to recheck.
+    The scan walks fixed id slices from the newest and stops once it has
+    [need] matches or the budget runs out, so the answer is always the newest
+    matches found in time. Slices stay small (20k ids) because for a larger
+    range the planner drops the BitmapAnd with the id range and rechecks every
+    trigram candidate in the table, once per slice.
+    """
+    ids: list[int] = []
+    conditions, values = scope_filters(5, **scope)
+    where = " AND ".join([*conditions, "id > $2", "id <= $3", "content ILIKE '%' || $1 || '%'"])
+    size = slice_rows or env_int("AGENT_MEMORY_GREP_SLICE_ROWS", 20000, minimum=1000, maximum=200000)
+    high = upper_id
+    while high > lower_id and len(ids) < need:
+        low = max(lower_id, high - size)
+        rows = await budget.fetch(
+            conn,
+            "substring",
+            f"""
+            SELECT id
+            FROM agent_memory_events
+            WHERE {where}
+            ORDER BY id DESC
+            LIMIT $4
+            """,
+            query, low, high, need - len(ids), *values,
+        )
+        if rows is None:
+            break
+        ids.extend(int(row["id"]) for row in rows)
+        high = low
+    return ids[:need]
 
 
 def search_cache_key(
@@ -428,9 +674,32 @@ async def _execute_ddl(conn: asyncpg.Connection, sql: str) -> None:
         return
 
 
+AUTOVACUUM_TABLE_OPTIONS = {
+    # The default scale factors wait for 10-20% of a table to change. On 1.5M
+    # rows that is 140k changes before an analyze and 280k inserts before a
+    # vacuum, weeks at hook rates, and longer after a crash restart wipes the
+    # counters. 1% means about a day.
+    "autovacuum_vacuum_insert_scale_factor": "0.01",
+    "autovacuum_analyze_scale_factor": "0.01",
+    "autovacuum_vacuum_scale_factor": "0.02",
+}
+
+
+async def _ensure_autovacuum_options(conn: asyncpg.Connection, table: str) -> None:
+    """Set the busy tables' autovacuum thresholds unless an operator chose others."""
+    options = await conn.fetchval("SELECT reloptions FROM pg_class WHERE oid = to_regclass($1)", "public." + table)
+    present = {item.split("=", 1)[0] for item in options or []}
+    missing = [f"{name} = {value}" for name, value in AUTOVACUUM_TABLE_OPTIONS.items() if name not in present]
+    if missing:
+        await conn.execute(f"ALTER TABLE {table} SET ({', '.join(missing)})")
+
+
 async def init_db_async() -> dict[str, Any]:
     conn = await connect()
     try:
+        # Every DDL below waits for a table lock, and hook inserts queue behind
+        # a waiting DDL. Give up after 5 s instead; rerun init when it is quiet.
+        await conn.execute("SET lock_timeout = '5s'")
         await _execute_ddl(conn, "CREATE EXTENSION IF NOT EXISTS vector")
         await _execute_ddl(conn, "CREATE EXTENSION IF NOT EXISTS pg_trgm")
         await _execute_ddl(
@@ -597,6 +866,106 @@ async def init_db_async() -> dict[str, Any]:
             $$
             """
         )
+        # Per-space counters for the search cache. The global
+        # revision above changes on every write anywhere, so one agent's hooks
+        # invalidated every cached search; it stays for older clients. Table,
+        # functions and triggers are created together, so no reader ever sees
+        # the table without the triggers that keep it current.
+        async with conn.transaction():
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agent_memory_space_search_state (
+                    space TEXT PRIMARY KEY,
+                    inserted_rows BIGINT NOT NULL DEFAULT 0,
+                    mutation_revision BIGINT NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE OR REPLACE FUNCTION agent_memory_space_search_insert()
+                RETURNS TRIGGER
+                LANGUAGE plpgsql
+                AS $$
+                BEGIN
+                    INSERT INTO agent_memory_space_search_state AS state (space, inserted_rows, updated_at)
+                    VALUES (NEW.space, 1, NOW())
+                    ON CONFLICT (space) DO UPDATE SET
+                        inserted_rows = state.inserted_rows + 1,
+                        updated_at = NOW();
+                    RETURN NULL;
+                END;
+                $$
+                """
+            )
+            await conn.execute(
+                """
+                CREATE OR REPLACE FUNCTION agent_memory_space_search_mutation()
+                RETURNS TRIGGER
+                LANGUAGE plpgsql
+                AS $$
+                DECLARE
+                    first_space TEXT;
+                    second_space TEXT;
+                BEGIN
+                    -- A row moved between spaces changes both. Lock them in
+                    -- name order so two opposite moves cannot deadlock.
+                    IF TG_OP = 'UPDATE' THEN
+                        first_space := LEAST(OLD.space, NEW.space);
+                        second_space := NULLIF(GREATEST(OLD.space, NEW.space), first_space);
+                    ELSE
+                        first_space := OLD.space;
+                    END IF;
+                    INSERT INTO agent_memory_space_search_state AS state (space, mutation_revision, updated_at)
+                    VALUES (first_space, 1, NOW())
+                    ON CONFLICT (space) DO UPDATE SET
+                        mutation_revision = state.mutation_revision + 1,
+                        updated_at = NOW();
+                    IF second_space IS NOT NULL THEN
+                        INSERT INTO agent_memory_space_search_state AS state (space, mutation_revision, updated_at)
+                        VALUES (second_space, 1, NOW())
+                        ON CONFLICT (space) DO UPDATE SET
+                            mutation_revision = state.mutation_revision + 1,
+                            updated_at = NOW();
+                    END IF;
+                    RETURN NULL;
+                END;
+                $$
+                """
+            )
+            # The "scope" names sort before the legacy "search" triggers, so
+            # every writer locks its space row before the global singleton.
+            await conn.execute(
+                """
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_trigger
+                        WHERE tgname = 'agent_memory_events_scope_insert_trg'
+                          AND tgrelid = 'agent_memory_events'::regclass
+                          AND NOT tgisinternal
+                    ) THEN
+                        CREATE TRIGGER agent_memory_events_scope_insert_trg
+                        AFTER INSERT ON agent_memory_events
+                        FOR EACH ROW
+                        EXECUTE FUNCTION agent_memory_space_search_insert();
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_trigger
+                        WHERE tgname = 'agent_memory_events_scope_mutation_trg'
+                          AND tgrelid = 'agent_memory_events'::regclass
+                          AND NOT tgisinternal
+                    ) THEN
+                        CREATE TRIGGER agent_memory_events_scope_mutation_trg
+                        AFTER UPDATE OR DELETE ON agent_memory_events
+                        FOR EACH ROW
+                        EXECUTE FUNCTION agent_memory_space_search_mutation();
+                    END IF;
+                END;
+                $$
+                """
+            )
         await _execute_ddl(
             conn,
             """
@@ -761,6 +1130,8 @@ async def init_db_async() -> dict[str, Any]:
         ]
         for sql in ddl:
             await _execute_ddl(conn, sql)
+        for table in ("agent_memory_events", "agent_memory_payload_archives"):
+            await _ensure_autovacuum_options(conn, table)
         await _execute_ddl(conn, """
             CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_memory_events_identity_gin_idx
             ON agent_memory_events USING GIN ((metadata->'identity'))
@@ -1274,6 +1645,260 @@ async def backfill_legacy_archives_async(*, limit: int = 0, dry_run: bool = Fals
         await conn.close()
 
 
+async def search_scope_state(conn: asyncpg.Connection, scope_space: str) -> dict[str, int]:
+    """Insert and mutation counters for one space, or summed over every space.
+
+    Row triggers keep agent_memory_space_search_state current inside each
+    writing transaction, so a reader's snapshot sees a row and its counter
+    together. A space with no row has had no writes since the triggers exist.
+    """
+    if scope_space:
+        row = await conn.fetchrow(
+            """
+            SELECT inserted_rows, mutation_revision
+            FROM agent_memory_space_search_state
+            WHERE space = $1
+            """,
+            scope_space,
+        )
+    else:
+        row = await conn.fetchrow(
+            """
+            SELECT COALESCE(sum(inserted_rows), 0)::BIGINT AS inserted_rows,
+                   COALESCE(sum(mutation_revision), 0)::BIGINT AS mutation_revision
+            FROM agent_memory_space_search_state
+            """
+        )
+    return {
+        "inserted_rows": int(row["inserted_rows"]) if row else 0,
+        "mutation_revision": int(row["mutation_revision"]) if row else 0,
+    }
+
+
+async def store_search_cache(
+    conn: asyncpg.Connection,
+    cache_key: str,
+    state: dict[str, int],
+    max_event_id: int,
+    results: list[dict[str, Any]],
+    *,
+    hit: bool,
+) -> None:
+    """Write one cache entry. Best effort: two searches storing the same key at
+    once conflict under REPEATABLE READ, and that must not fail the search."""
+    try:
+        await conn.execute("SELECT set_config('statement_timeout', '3000', true)")
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO agent_memory_search_cache AS cache (
+                    cache_key, revision, mutation_revision, max_event_id, results, result_count,
+                    hit_count, created_at, refreshed_at, last_accessed_at
+                )
+                VALUES ($1, $2, $3, $4, $5::JSONB, $6, 0, NOW(), NOW(), NOW())
+                ON CONFLICT (cache_key) DO UPDATE SET
+                    revision = EXCLUDED.revision,
+                    mutation_revision = EXCLUDED.mutation_revision,
+                    max_event_id = EXCLUDED.max_event_id,
+                    results = EXCLUDED.results,
+                    result_count = EXCLUDED.result_count,
+                    hit_count = CASE WHEN $7 THEN cache.hit_count + 1 ELSE 0 END,
+                    refreshed_at = NOW(),
+                    last_accessed_at = NOW()
+                """,
+                cache_key,
+                state["inserted_rows"],
+                state["mutation_revision"],
+                max_event_id,
+                results,
+                len(results),
+                hit,
+            )
+            if not hit:
+                await conn.execute(
+                    """
+                    DELETE FROM agent_memory_search_cache
+                    WHERE cache_key IN (
+                        SELECT cache_key
+                        FROM agent_memory_search_cache
+                        WHERE last_accessed_at < NOW() - INTERVAL '7 days'
+                        ORDER BY last_accessed_at
+                        LIMIT 200
+                    )
+                    """
+                )
+    except asyncpg.PostgresError:
+        pass
+
+
+async def touch_search_cache(conn: asyncpg.Connection, cache_key: str) -> None:
+    try:
+        await conn.execute("SELECT set_config('statement_timeout', '3000', true)")
+        async with conn.transaction():
+            await conn.execute(
+                """
+                UPDATE agent_memory_search_cache
+                SET hit_count = hit_count + 1, last_accessed_at = NOW()
+                WHERE cache_key = $1
+                """,
+                cache_key,
+            )
+    except asyncpg.PostgresError:
+        pass
+
+
+async def hybrid_search_rows(
+    conn: asyncpg.Connection,
+    budget: SearchBudget,
+    *,
+    query: str,
+    qvec: str,
+    scope: dict[str, Any],
+    limit: int,
+    candidate_limit: int,
+    text_pool: int,
+    upper_id: int,
+    lower_id: int = 0,
+    use_phrase_candidates: bool = False,
+    vector_enabled: bool = True,
+) -> list[Any]:
+    """Collect bounded candidates leg by leg, then blend-score at most a few hundred rows.
+
+    Legs, each under its own timeout (SearchBudget):
+    - full text: the newest [text_pool] matches, ranked by ts_rank_cd, top [candidate_limit];
+    - vector: HNSW nearest neighbours (relaxed iterative scan, ef_search = candidate_limit);
+    - phrase (opt-in): the newest ILIKE matches.
+    With lower_id > 0 every leg is limited to ids in (lower_id, upper_id]: a
+    cached result then scores only the rows written since, and the vector leg
+    sorts that range exactly, since HNSW cannot serve an id range.
+    """
+    delta = lower_id > 0
+    candidate_ids: dict[int, None] = {}
+    window = upper_id - lower_id if delta else env_int(
+        "AGENT_MEMORY_SEARCH_RECENT_WINDOW", 20000, minimum=1000, maximum=1000000
+    )
+    pool = await newest_text_match_ids(
+        conn,
+        budget,
+        tsquery_function="plainto_tsquery",
+        query=query,
+        scope=scope,
+        need=text_pool,
+        enough=candidate_limit,
+        upper_id=upper_id,
+        lower_id=lower_id,
+        window=window,
+    )
+    ranked = pool
+    if len(pool) > candidate_limit:
+        rows = await budget.fetch(
+            conn,
+            "text_rank",
+            """
+            SELECT id
+            FROM agent_memory_events
+            WHERE id = ANY($2::BIGINT[])
+            ORDER BY ts_rank_cd(search_vector, plainto_tsquery('english', $1)) DESC, id DESC
+            LIMIT $3
+            """,
+            query, pool, candidate_limit,
+        )
+        ranked = [int(row["id"]) for row in rows] if rows is not None else pool[:candidate_limit]
+    candidate_ids.update(dict.fromkeys(ranked))
+
+    if vector_enabled:
+        conditions, values = scope_filters(3, **scope)
+        order_sql = "embedding <=> $1::VECTOR"
+        if delta:
+            conditions += [f"id > ${3 + len(values)}", f"id <= ${4 + len(values)}"]
+            values += [lower_id, upper_id]
+            order_sql = "(embedding <=> $1::VECTOR) + 0"
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        rows = await budget.fetch(
+            conn,
+            "vector",
+            f"""
+            SELECT id
+            FROM agent_memory_events
+            {where}
+            ORDER BY {order_sql}
+            LIMIT $2
+            """,
+            qvec, candidate_limit, *values,
+        )
+        candidate_ids.update(dict.fromkeys(int(row["id"]) for row in rows or []))
+
+    if use_phrase_candidates:
+        phrase_ids = await newest_substring_match_ids(
+            conn, budget, query=query, scope=scope, need=min(candidate_limit, max(20, limit * 2)),
+            upper_id=upper_id, lower_id=lower_id,
+        )
+        candidate_ids.update(dict.fromkeys(phrase_ids))
+
+    if not candidate_ids:
+        return []
+    # Trigram similarity over a whole TOASTed content is the costly part of the
+    # blended score (about 1-1.5 s for 800 candidates). It adds at most 0.10,
+    # so a row whose other parts score more than 0.10 under the [limit]-th best
+    # cannot reach the top. Score those parts first, then the full score only
+    # for rows that still can. The cap only matters for very flat score lists.
+    partial_rows = await budget.fetch(
+        conn,
+        "partial_score",
+        """
+        WITH q AS (SELECT plainto_tsquery('english', $1) AS tsq, $2::VECTOR AS emb)
+        SELECT
+            e.id,
+            (1 - (e.embedding <=> (SELECT emb FROM q))) * 0.68
+            + ts_rank_cd(e.search_vector, (SELECT tsq FROM q)) * 0.22
+            + CASE WHEN e.search_vector @@ (SELECT tsq FROM q) THEN 0.18 ELSE 0.0 END AS partial_score
+        FROM agent_memory_events e
+        WHERE e.id = ANY($3::BIGINT[])
+        """,
+        query, qvec, list(candidate_ids),
+    )
+    if partial_rows is not None:
+        partial = sorted(
+            ((float(row["partial_score"] or 0.0), int(row["id"])) for row in partial_rows), reverse=True,
+        )
+        if len(partial) > limit:
+            cutoff = partial[limit - 1][0] - 0.10
+            keep_max = env_int("AGENT_MEMORY_SEARCH_SCORE_POOL", max(100, limit * 10), minimum=limit, maximum=2000)
+            candidate_ids = dict.fromkeys(row_id for score, row_id in partial[:keep_max] if score >= cutoff)
+    rows = await budget.fetch(
+        conn,
+        "score",
+        """
+        WITH q AS (
+            SELECT
+                plainto_tsquery('english', $1) AS tsq,
+                $2::VECTOR AS emb,
+                $1::TEXT AS raw_query
+        )
+        SELECT
+            e.id, e.created_at, e.space, e.session_id, e.agent, e.event_type, e.memory_kind, e.role, e.source,
+            e.summary, e.tags, e.metadata - 'raw_payload' AS metadata,
+            left(e.content, 2400) AS content,
+            1 - (e.embedding <=> (SELECT emb FROM q)) AS semantic_score,
+            ts_rank_cd(e.search_vector, (SELECT tsq FROM q)) AS text_score,
+            similarity(e.content, (SELECT raw_query FROM q)) AS trigram_score,
+            e.search_vector @@ (SELECT tsq FROM q) AS lexical_match,
+            (
+                (1 - (e.embedding <=> (SELECT emb FROM q))) * 0.68
+                + ts_rank_cd(e.search_vector, (SELECT tsq FROM q)) * 0.22
+                + similarity(e.content, (SELECT raw_query FROM q)) * 0.10
+                + CASE WHEN e.search_vector @@ (SELECT tsq FROM q) THEN 0.18 ELSE 0.0 END
+            ) AS score
+        FROM agent_memory_events e
+        WHERE e.id = ANY($3::BIGINT[])
+        ORDER BY score DESC, e.created_at DESC, e.id DESC
+        LIMIT $4
+        """,
+        query, qvec, list(candidate_ids), limit,
+    )
+    return rows or []
+
+
 async def search_events_async(
     query: str,
     *,
@@ -1287,66 +1912,24 @@ async def search_events_async(
     min_score: float | None = None,
 ) -> list[dict[str, Any]]:
     qvec = vector_literal(cpu_embedding(query))
-    filters = []
-    params: list[Any] = [query, qvec, query]
-    idx = 4
-    if space and not all_spaces:
-        filters.append(f"space = ${idx}")
-        params.append(normalize_space(space))
-        idx += 1
-    if agent:
-        filters.append(f"agent = ${idx}")
-        params.append(agent)
-        idx += 1
-    if event_type:
-        filters.append(f"event_type = ${idx}")
-        params.append(event_type)
-        idx += 1
-    if memory_kind:
-        filters.append(f"memory_kind = ${idx}")
-        params.append(memory_kind)
-        idx += 1
-    if tags:
-        filters.append(f"tags && ${idx}::TEXT[]")
-        params.append(tags)
-        idx += 1
-    def where_clause(extra: str = "") -> str:
-        parts = [*filters]
-        if extra:
-            parts.append(extra)
-        return ("WHERE " + " AND ".join(parts)) if parts else ""
-
-    where = where_clause()
-    text_where = where_clause("search_vector @@ (SELECT tsq FROM q)")
-    phrase_where = where_clause("content ILIKE '%' || (SELECT raw_query FROM q) || '%'")
+    scope = {
+        "space": space,
+        "all_spaces": all_spaces,
+        "agent": agent,
+        "event_type": event_type,
+        "memory_kind": memory_kind,
+        "tags": tags,
+    }
+    scope_space = normalize_space(space) if space and not all_spaces else ""
     candidate_limit = search_candidate_limit(limit)
-    candidate_idx = idx
-    base_params = list(params)
-    params.append(candidate_limit)
-    idx += 1
-    final_limit_idx = idx
-    params.append(limit)
+    text_pool = max(candidate_limit, env_int("AGENT_MEMORY_SEARCH_TEXT_POOL", 1000, minimum=100, maximum=10000))
     phrase_candidates_enabled = os.getenv("AGENT_MEMORY_ENABLE_PHRASE_CANDIDATES", "").lower() in {"1", "true", "yes"}
     use_phrase_candidates = (
         phrase_candidates_enabled
         and len(query.strip()) >= 12
         and bool(re.search(r"\s", query.strip()))
     )
-    phrase_candidate_sql = ""
-    phrase_union_sql = ""
-    if use_phrase_candidates:
-        phrase_candidate_sql = f"""
-            ,
-            phrase_candidates AS MATERIALIZED (
-                SELECT id
-                FROM agent_memory_events
-                {phrase_where}
-                ORDER BY created_at DESC
-                LIMIT ${candidate_idx}
-            )"""
-        phrase_union_sql = """
-                UNION
-                SELECT id FROM phrase_candidates"""
+    vector_enabled = env_flag("AGENT_MEMORY_SEARCH_VECTOR", True)
 
     threshold = DEFAULT_MIN_SEARCH_SCORE if min_score is None else max(-1.0, min(float(min_score), 1.0))
     cache_key = search_cache_key(
@@ -1395,6 +1978,10 @@ async def search_events_async(
     conn = await connect()
     try:
         search_timeout_ms = max(1000, min(int(os.getenv("AGENT_MEMORY_SEARCH_TIMEOUT_MS", "15000")), 60000))
+        budget = SearchBudget(
+            search_timeout_ms,
+            env_int("AGENT_MEMORY_SEARCH_LEG_TIMEOUT_MS", 5000, minimum=500, maximum=search_timeout_ms),
+        )
         await conn.execute(f"SET statement_timeout = {search_timeout_ms}")
         ef_search = max(40, min(MAX_SEARCH_CANDIDATES, candidate_limit))
         try:
@@ -1402,32 +1989,29 @@ async def search_events_async(
         except Exception:
             pass
         try:
-            await conn.execute("SET hnsw.iterative_scan = strict_order")
+            # Candidates are re-scored afterwards, so the iterative scan does
+            # not need strict distance order, and max_scan_tuples caps a
+            # filtered scan through a large space.
+            await conn.execute("SET hnsw.iterative_scan = relaxed_order")
             await conn.execute(f"SET hnsw.max_scan_tuples = {max(candidate_limit * 20, 20000)}")
         except Exception:
             pass
         async with conn.transaction(isolation="repeatable_read"):
-            cache_available = False
-            if search_cache_enabled():
-                cache_available = bool(
-                    await conn.fetchval(
-                        """
-                        SELECT to_regclass('public.agent_memory_search_cache') IS NOT NULL
-                           AND to_regclass('public.agent_memory_search_state') IS NOT NULL
-                        """
-                    )
+            await search_session_settings(conn)
+            current_max_event_id = int(
+                await conn.fetchval("SELECT COALESCE(max(id), 0) FROM agent_memory_events") or 0
+            )
+            cache_available = search_cache_enabled() and bool(
+                await conn.fetchval(
+                    """
+                    SELECT to_regclass('public.agent_memory_search_cache') IS NOT NULL
+                       AND to_regclass('public.agent_memory_space_search_state') IS NOT NULL
+                    """
                 )
+            )
+            state: dict[str, int] | None = None
             if cache_available:
-                state = await conn.fetchrow(
-                    """
-                    SELECT revision, mutation_revision
-                    FROM agent_memory_search_state
-                    WHERE singleton = TRUE
-                    """
-                )
-                current_max_event_id = int(
-                    await conn.fetchval("SELECT COALESCE(max(id), 0) FROM agent_memory_events") or 0
-                )
+                state = await search_scope_state(conn, scope_space)
                 cached = await conn.fetchrow(
                     """
                     SELECT revision, mutation_revision, max_event_id, results
@@ -1436,186 +2020,77 @@ async def search_events_async(
                     """,
                     cache_key,
                 )
-                if (
-                    cached
-                    and state
-                    and int(cached["mutation_revision"]) == int(state["mutation_revision"])
-                    and int(cached["revision"]) == int(state["revision"])
-                    and int(cached["max_event_id"]) == current_max_event_id
-                ):
-                    await conn.execute(
-                        """
-                        UPDATE agent_memory_search_cache
-                        SET hit_count = hit_count + 1, last_accessed_at = NOW()
-                        WHERE cache_key = $1
-                        """,
-                        cache_key,
-                    )
-                    return restore_cached_search_results(cached["results"])
-                if cached and state and int(cached["mutation_revision"]) == int(state["mutation_revision"]):
+                # v3 entries: revision = the scope's inserted_rows when stored,
+                # max_event_id = the newest id visible then. Writes to other
+                # spaces leave a scoped entry valid.
+                if cached and int(cached["mutation_revision"]) == state["mutation_revision"]:
+                    cached_rows = int(cached["revision"])
                     cached_max_event_id = int(cached["max_event_id"])
-                    try:
-                        delta_max = max(1, min(int(os.getenv("AGENT_MEMORY_SEARCH_CACHE_DELTA_MAX", "5000")), 50000))
-                    except ValueError:
-                        delta_max = 5000
-                    if (
-                        current_max_event_id > cached_max_event_id
-                        and current_max_event_id - cached_max_event_id <= delta_max
-                    ):
-                        delta_start_idx = candidate_idx
-                        delta_end_idx = candidate_idx + 1
-                        delta_limit_idx = candidate_idx + 2
-                        delta_where = where_clause(
-                            f"id > ${delta_start_idx} AND id <= ${delta_end_idx}"
-                        )
-                        delta_rows = await conn.fetch(
+                    if cached_rows == state["inserted_rows"]:
+                        await touch_search_cache(conn, cache_key)
+                        budget.report("cache_hit")
+                        return restore_cached_search_results(cached["results"])
+                    delta_max = env_int("AGENT_MEMORY_SEARCH_CACHE_DELTA_MAX", 5000, minimum=1, maximum=50000)
+                    new_rows = state["inserted_rows"] - cached_rows
+                    id_gap = current_max_event_id - cached_max_event_id
+                    if 0 < new_rows <= delta_max and 0 < id_gap <= delta_max * 20:
+                        # Every row the scope gained must sit above the entry's
+                        # max id. A writer that took a lower id and committed
+                        # later would be missed, so the counts must agree.
+                        conditions, values = scope_filters(3, space=scope_space)
+                        in_range = await conn.fetchval(
                             f"""
-                            WITH q AS (
-                                SELECT
-                                    plainto_tsquery('english', $1) AS tsq,
-                                    $2::VECTOR AS emb,
-                                    $3 AS raw_query
+                            SELECT count(*)
+                            FROM agent_memory_events
+                            WHERE {" AND ".join([*conditions, "id > $1", "id <= $2"])}
+                            """,
+                            cached_max_event_id, current_max_event_id, *values,
+                        )
+                        if int(in_range or 0) == new_rows:
+                            delta_rows = await hybrid_search_rows(
+                                conn,
+                                budget,
+                                query=query,
+                                qvec=qvec,
+                                scope=scope,
+                                limit=limit,
+                                candidate_limit=candidate_limit,
+                                text_pool=text_pool,
+                                upper_id=current_max_event_id,
+                                lower_id=cached_max_event_id,
+                                use_phrase_candidates=use_phrase_candidates,
+                                vector_enabled=vector_enabled,
                             )
-                            SELECT
-                                e.id, e.created_at, e.space, e.session_id, e.agent, e.event_type, e.memory_kind, e.role, e.source,
-                                e.summary, e.tags, e.metadata - 'raw_payload' AS metadata,
-                                left(e.content, 2400) AS content,
-                                1 - (e.embedding <=> (SELECT emb FROM q)) AS semantic_score,
-                                ts_rank_cd(e.search_vector, (SELECT tsq FROM q)) AS text_score,
-                                similarity(e.content, (SELECT raw_query FROM q)) AS trigram_score,
-                                e.search_vector @@ (SELECT tsq FROM q) AS lexical_match,
-                                (
-                                    (1 - (e.embedding <=> (SELECT emb FROM q))) * 0.68
-                                    + ts_rank_cd(e.search_vector, (SELECT tsq FROM q)) * 0.22
-                                    + similarity(e.content, (SELECT raw_query FROM q)) * 0.10
-                                    + CASE WHEN e.search_vector @@ (SELECT tsq FROM q) THEN 0.18 ELSE 0.0 END
-                                ) AS score
-                            FROM agent_memory_events e
-                            {delta_where}
-                            ORDER BY score DESC, e.created_at DESC, e.id DESC
-                            LIMIT ${delta_limit_idx}
-                            """,
-                            *base_params,
-                            cached_max_event_id,
-                            current_max_event_id,
-                            limit,
-                        )
-                        merged_results = merge_results(
-                            restore_cached_search_results(cached["results"]),
-                            filtered_results(delta_rows),
-                        )
-                        await conn.execute(
-                            """
-                            UPDATE agent_memory_search_cache
-                            SET revision = $2,
-                                mutation_revision = $3,
-                                max_event_id = $4,
-                                results = $5::JSONB,
-                                result_count = $6,
-                                hit_count = hit_count + 1,
-                                refreshed_at = NOW(),
-                                last_accessed_at = NOW()
-                            WHERE cache_key = $1
-                            """,
-                            cache_key,
-                            int(state["revision"]),
-                            int(state["mutation_revision"]),
-                            current_max_event_id,
-                            merged_results,
-                            len(merged_results),
-                        )
-                        return merged_results
+                            merged_results = merge_results(
+                                restore_cached_search_results(cached["results"]),
+                                filtered_results(delta_rows),
+                            )
+                            if budget.complete:
+                                await store_search_cache(
+                                    conn, cache_key, state, current_max_event_id, merged_results, hit=True,
+                                )
+                            budget.report("cache_delta")
+                            return merged_results
 
-            rows = await conn.fetch(
-                f"""
-                WITH q AS (
-                    SELECT
-                        plainto_tsquery('english', $1) AS tsq,
-                        $2::VECTOR AS emb,
-                        $3 AS raw_query
-                ),
-                vector_candidates AS MATERIALIZED (
-                    SELECT id
-                    FROM agent_memory_events
-                    {where}
-                    ORDER BY embedding <=> (SELECT emb FROM q)
-                    LIMIT ${candidate_idx}
-                ),
-                text_candidates AS MATERIALIZED (
-                    SELECT id
-                    FROM agent_memory_events
-                    {text_where}
-                    ORDER BY ts_rank_cd(search_vector, (SELECT tsq FROM q)) DESC, created_at DESC, id DESC
-                    LIMIT ${candidate_idx}
-                )
-                {phrase_candidate_sql},
-                candidate_ids AS (
-                    SELECT id FROM vector_candidates
-                    UNION
-                    SELECT id FROM text_candidates
-                    {phrase_union_sql}
-                )
-                SELECT
-                    e.id, e.created_at, e.space, e.session_id, e.agent, e.event_type, e.memory_kind, e.role, e.source,
-                    e.summary, e.tags, e.metadata - 'raw_payload' AS metadata,
-                    left(e.content, 2400) AS content,
-                    1 - (e.embedding <=> (SELECT emb FROM q)) AS semantic_score,
-                    ts_rank_cd(e.search_vector, (SELECT tsq FROM q)) AS text_score,
-                    similarity(e.content, (SELECT raw_query FROM q)) AS trigram_score,
-                    e.search_vector @@ (SELECT tsq FROM q) AS lexical_match,
-                    (
-                        (1 - (e.embedding <=> (SELECT emb FROM q))) * 0.68
-                        + ts_rank_cd(e.search_vector, (SELECT tsq FROM q)) * 0.22
-                        + similarity(e.content, (SELECT raw_query FROM q)) * 0.10
-                        + CASE WHEN e.search_vector @@ (SELECT tsq FROM q) THEN 0.18 ELSE 0.0 END
-                    ) AS score
-                FROM agent_memory_events e
-                JOIN candidate_ids c ON c.id = e.id
-                ORDER BY score DESC, e.created_at DESC, e.id DESC
-                LIMIT ${final_limit_idx}
-                """,
-                *params,
+            rows = await hybrid_search_rows(
+                conn,
+                budget,
+                query=query,
+                qvec=qvec,
+                scope=scope,
+                limit=limit,
+                candidate_limit=candidate_limit,
+                text_pool=text_pool,
+                upper_id=current_max_event_id,
+                use_phrase_candidates=use_phrase_candidates,
+                vector_enabled=vector_enabled,
             )
             results = filtered_results(rows)
-
-            if cache_available:
-                assert state is not None
-                await conn.execute(
-                    """
-                    INSERT INTO agent_memory_search_cache (
-                        cache_key, revision, mutation_revision, max_event_id, results, result_count,
-                        hit_count, created_at, refreshed_at, last_accessed_at
-                    )
-                    VALUES ($1, $2, $3, $4, $5::JSONB, $6, 0, NOW(), NOW(), NOW())
-                    ON CONFLICT (cache_key) DO UPDATE SET
-                        revision = EXCLUDED.revision,
-                        mutation_revision = EXCLUDED.mutation_revision,
-                        max_event_id = EXCLUDED.max_event_id,
-                        results = EXCLUDED.results,
-                        result_count = EXCLUDED.result_count,
-                        hit_count = 0,
-                        refreshed_at = NOW(),
-                        last_accessed_at = NOW()
-                    """,
-                    cache_key,
-                    int(state["revision"]),
-                    int(state["mutation_revision"]),
-                    current_max_event_id,
-                    results,
-                    len(results),
-                )
-                await conn.execute(
-                    """
-                    DELETE FROM agent_memory_search_cache
-                    WHERE cache_key IN (
-                        SELECT cache_key
-                        FROM agent_memory_search_cache
-                        WHERE last_accessed_at < NOW() - INTERVAL '7 days'
-                        ORDER BY last_accessed_at
-                        LIMIT 200
-                    )
-                    """
-                )
+            # An answer with a skipped leg is still returned, but not cached,
+            # so the next identical search tries every leg again.
+            if cache_available and state is not None and budget.complete:
+                await store_search_cache(conn, cache_key, state, current_max_event_id, results, hit=False)
+            budget.report("full")
             return results
     finally:
         await conn.close()
@@ -1652,79 +2127,81 @@ async def grep_events_async(
     contains: bool = False,
     timeout_ms: int = 15000,
 ) -> list[dict[str, Any]]:
+    """Exact-term (full-text) or substring (--contains) matches, from the newest rows.
+
+    Both modes first collect a bounded pool of the newest matches and only
+    rank that pool, by ts_rank_cd or by trigram similarity. A word with
+    hundreds of thousands of matches no longer ranks every one of them.
+    """
     query = (query or "").strip()
     if not query:
         raise ValueError("query is required")
     limit = max(1, min(int(limit), 500))
     timeout_ms = max(1000, min(int(timeout_ms), 60000))
-    filters = []
-    params: list[Any] = [query]
-    idx = 2
-    if space and not all_spaces:
-        filters.append(f"space = ${idx}")
-        params.append(normalize_space(space))
-        idx += 1
-    if agent:
-        filters.append(f"agent = ${idx}")
-        params.append(agent)
-        idx += 1
-    if event_type:
-        filters.append(f"event_type = ${idx}")
-        params.append(event_type)
-        idx += 1
-    if memory_kind:
-        filters.append(f"memory_kind = ${idx}")
-        params.append(memory_kind)
-        idx += 1
-    if tags:
-        filters.append(f"tags && ${idx}::TEXT[]")
-        params.append(tags)
-        idx += 1
-    since_dt = parse_datetime_arg(since)
-    if since_dt:
-        filters.append(f"created_at >= ${idx}")
-        params.append(since_dt)
-        idx += 1
-    params.append(limit)
-    filter_sql = (" AND " + " AND ".join(filters)) if filters else ""
+    scope = {
+        "space": space,
+        "all_spaces": all_spaces,
+        "agent": agent,
+        "event_type": event_type,
+        "memory_kind": memory_kind,
+        "tags": tags,
+        "since": parse_datetime_arg(since),
+    }
     conn = await connect()
     try:
         await conn.execute(f"SET statement_timeout = {timeout_ms}")
-        if contains:
-            contains_candidate_limit = max(200, min(5000, limit * 50))
-            contains_params = [*params, contains_candidate_limit]
-            contains_candidate_idx = idx + 1
-            rows = await conn.fetch(
-                f"""
-                WITH candidates AS MATERIALIZED (
-                    SELECT id
-                    FROM agent_memory_events
-                    WHERE content ILIKE '%' || $1 || '%'{filter_sql}
-                    LIMIT ${contains_candidate_idx}
+        budget = SearchBudget(
+            timeout_ms, env_int("AGENT_MEMORY_SEARCH_LEG_TIMEOUT_MS", 5000, minimum=500, maximum=timeout_ms),
+        )
+        async with conn.transaction():
+            await search_session_settings(conn)
+            upper_id = int(await conn.fetchval("SELECT COALESCE(max(id), 0) FROM agent_memory_events") or 0)
+            if contains:
+                # Twice [limit] of the newest matches, ranked by similarity.
+                pool = await newest_substring_match_ids(
+                    conn, budget, query=query, scope=scope, need=min(1000, limit * 2), upper_id=upper_id,
                 )
-                SELECT e.id, e.created_at, e.space, e.session_id, e.agent, e.event_type, e.memory_kind, e.role, e.source,
-                       e.summary, e.tags, e.metadata - 'raw_payload' AS metadata, left(e.content, 2400) AS content,
-                       similarity(e.content, $1) AS score
-                FROM agent_memory_events e
-                JOIN candidates c ON c.id = e.id
-                ORDER BY similarity(e.content, $1) DESC, e.created_at DESC
-                LIMIT ${idx}
-                """,
-                *contains_params,
-            )
-        else:
-            rows = await conn.fetch(
-                f"""
-                WITH q AS (SELECT websearch_to_tsquery('english', $1) AS tsq)
-                SELECT id, created_at, space, session_id, agent, event_type, memory_kind, role, source,
-                       summary, tags, metadata - 'raw_payload' AS metadata, left(content, 2400) AS content,
-                       ts_rank_cd(search_vector, (SELECT tsq FROM q)) AS score
-                FROM agent_memory_events
-                WHERE search_vector @@ (SELECT tsq FROM q){filter_sql}
-                ORDER BY ts_rank_cd(search_vector, (SELECT tsq FROM q)) DESC, created_at DESC
-                LIMIT ${idx}
-                """,
-                *params,
+                score_sql = "similarity(e.content, $1)"
+            else:
+                # Rank the newest matches; read older rows only when the newest
+                # window holds fewer than max(5 x limit, 50) of them.
+                pool = await newest_text_match_ids(
+                    conn,
+                    budget,
+                    tsquery_function="websearch_to_tsquery",
+                    query=query,
+                    scope=scope,
+                    need=min(MAX_SEARCH_CANDIDATES, max(200, limit * 20)),
+                    enough=max(50, limit * 5),
+                    upper_id=upper_id,
+                    window=env_int("AGENT_MEMORY_SEARCH_RECENT_WINDOW", 20000, minimum=1000, maximum=1000000),
+                )
+                score_sql = "ts_rank_cd(e.search_vector, websearch_to_tsquery('english', $1))"
+            rows = []
+            if pool:
+                rows = await budget.fetch(
+                    conn,
+                    "rank",
+                    f"""
+                    SELECT e.id, e.created_at, e.space, e.session_id, e.agent, e.event_type, e.memory_kind, e.role,
+                           e.source, e.summary, e.tags, e.metadata - 'raw_payload' AS metadata,
+                           left(e.content, 2400) AS content,
+                           {score_sql} AS score
+                    FROM agent_memory_events e
+                    WHERE e.id = ANY($2::BIGINT[])
+                    ORDER BY score DESC, e.created_at DESC
+                    LIMIT $3
+                    """,
+                    query, pool, limit,
+                ) or []
+        budget.report("grep")
+        if not budget.complete:
+            # Still a valid answer: the newest matches found in time. Say so on
+            # stderr, which --json callers keep apart from the result list.
+            print(
+                f"grep: the {timeout_ms} ms budget ran out before every row was searched; "
+                "these are the newest matches found. Narrow with --space or --since.",
+                file=sys.stderr,
             )
         return [dict(row) for row in rows]
     finally:
@@ -2760,6 +3237,26 @@ async def status_async(*, details: bool = False) -> dict[str, Any]:
                 """
             )
             result["search_cache"] = dict(cache_stats) if cache_stats else {"revision": 0, "mutation_revision": 0, "entries": 0, "hits": 0}
+            space_state_available = bool(
+                await conn.fetchval("SELECT to_regclass('public.agent_memory_space_search_state') IS NOT NULL")
+            )
+            if space_state_available:
+                # Cache entries are validated per space; these are
+                # the counters they compare against, summed. A few thousand
+                # rows at most, one per space written since init.
+                space_state = await conn.fetchrow(
+                    """
+                    SELECT count(*) AS tracked_spaces,
+                           COALESCE(sum(inserted_rows), 0)::BIGINT AS inserted_rows,
+                           COALESCE(sum(mutation_revision), 0)::BIGINT AS space_mutations
+                    FROM agent_memory_space_search_state
+                    """
+                )
+                if space_state:
+                    result["search_cache"]["scope"] = "space"
+                    result["search_cache"].update(dict(space_state))
+            else:
+                result["search_cache"]["scope"] = "global"
         else:
             result["search_cache"] = {"available": False}
         if details:
@@ -3028,6 +3525,7 @@ async def self_test_schema_async() -> dict[str, Any]:
         "agent_memory_payload_archives": "id event_id event_uid payload_sha256 payload_kind payload_format compression raw_chars compressed_bytes redacted space session_id agent event_type source payload metadata created_at",
         "agent_memory_search_state": "singleton revision mutation_revision updated_at",
         "agent_memory_search_cache": "cache_key revision mutation_revision max_event_id results result_count hit_count created_at refreshed_at last_accessed_at",
+        "agent_memory_space_search_state": "space inserted_rows mutation_revision updated_at",
     }
     conn = await connect()
     try:
