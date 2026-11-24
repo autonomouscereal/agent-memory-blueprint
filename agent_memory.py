@@ -3288,24 +3288,6 @@ async def audit_events_async(
 
     conn = await connect()
     try:
-        if identity_filter:
-            # The identity GIN has no statistics for @>, so the planner always
-            # guesses about 1,200 matches. For harness=claude_code (465k rows)
-            # that bitmap read every match to sort them: 17.6 s. Walking
-            # created_at backwards finds a common identity's newest rows in
-            # about 1 ms, so try that first under a short timeout, and fall back
-            # to the GIN bitmap, which is fast exactly when the walk is not.
-            walk_ms = env_int("AGENT_MEMORY_AUDIT_WALK_MS", 500, minimum=50, maximum=60000)
-            try:
-                async with conn.transaction():
-                    await conn.execute(
-                        "SELECT set_config('enable_bitmapscan', 'off', true), set_config('statement_timeout', $1, true)",
-                        str(walk_ms),
-                    )
-                    rows = await conn.fetch(sql, *params)
-                return [dict(row) for row in rows]
-            except asyncpg.QueryCanceledError:
-                pass
         rows = await conn.fetch(sql, *params)
         return [dict(row) for row in rows]
     finally:

@@ -400,35 +400,6 @@ def audit_row(row_id):
 
 
 class AuditTests(unittest.IsolatedAsyncioTestCase):
-    async def test_identity_audit_walks_created_at_first(self):
-        conn = FakeConnection([("ORDER BY created_at DESC", [audit_row(9), audit_row(8)])])
-        with patch.object(agent_memory, "connect", AsyncMock(return_value=conn)):
-            rows = await agent_memory.audit_events_async(limit=2, harness="claude_code", all_spaces=True)
-        self.assertEqual([row["id"] for row in rows], [9, 8])
-        self.assertEqual(len(conn.sql("fetch")), 1)
-        walk = [call for call in conn.calls if call[0] == "execute"][0]
-        self.assertIn("set_config('enable_bitmapscan', 'off', true)", walk[1])
-        self.assertIn("set_config('statement_timeout', $1, true)", walk[1])
-        self.assertEqual(walk[2], ("500",))
-        args = [args for kind, _sql, args in conn.calls if kind == "fetch"][0]
-        self.assertEqual(args, ({"harness": "claude_code"}, 2))
-
-    async def test_identity_audit_falls_back_to_the_gin_bitmap(self):
-        answers = [asyncpg.QueryCanceledError("canceling statement due to statement timeout"), [audit_row(5)]]
-
-        def answer(_args):
-            item = answers.pop(0)
-            if isinstance(item, BaseException):
-                raise item
-            return item
-
-        conn = FakeConnection([("ORDER BY created_at DESC", answer)])
-        with patch.object(agent_memory, "connect", AsyncMock(return_value=conn)):
-            rows = await agent_memory.audit_events_async(limit=20, harness="hermes", all_spaces=True)
-        self.assertEqual([row["id"] for row in rows], [5])
-        self.assertEqual(len(conn.sql("fetch")), 2)
-        self.assertTrue(conn.closed)
-
     async def test_session_audit_runs_one_plain_query(self):
         conn = FakeConnection([("ORDER BY created_at DESC", [audit_row(3)])])
         with patch.object(agent_memory, "connect", AsyncMock(return_value=conn)):

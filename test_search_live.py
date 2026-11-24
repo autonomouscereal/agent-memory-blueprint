@@ -255,12 +255,8 @@ class LiveSpaceCountTests(unittest.IsolatedAsyncioTestCase):
             await add(self.space_a, f"{self.marker} identity {n}", metadata={"identity": {"harness": harness}})
         rows = await agent_memory.audit_events_async(limit=2, harness=harness, all_spaces=True)
         self.assertEqual([row["content"] for row in rows], [f"{self.marker} identity 2", f"{self.marker} identity 1"])
-        os.environ["AGENT_MEMORY_AUDIT_WALK_MS"] = "50"
-        try:
-            rows = await agent_memory.audit_events_async(limit=5, harness=harness, all_spaces=True)
-        finally:
-            os.environ.pop("AGENT_MEMORY_AUDIT_WALK_MS", None)
-        self.assertEqual(len(rows), 3)
+        rows = await agent_memory.audit_events_async(limit=5, session_id="no-such-session", all_spaces=True)
+        self.assertEqual(rows, [])
 
 
 if __name__ == "__main__":
