@@ -494,6 +494,17 @@ class SpaceCountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(executes[-2], "UPDATE agent_memory_space_search_state SET event_count = 0")
         self.assertIn("SELECT space, count(*), NOW() FROM agent_memory_events GROUP BY space", executes[-1])
 
+    async def test_trigram_index_is_switched_to_direct_writes_once(self):
+        conn = FakeConnection([("SELECT reloptions FROM pg_class", None), ("gin_clean_pending_list", 12)])
+        self.assertTrue(await agent_memory._ensure_trigram_fastupdate_off(conn))
+        self.assertEqual(conn.sql("execute"), ["ALTER INDEX agent_memory_events_content_trgm_idx SET (fastupdate = off)"])
+        # The list it already holds is flushed once, after the switch.
+        self.assertIn("gin_clean_pending_list('agent_memory_events_content_trgm_idx'::regclass)", conn.sql("fetchval")[-1])
+        for chosen in (["fastupdate=off"], ["fastupdate=on"]):
+            conn = FakeConnection([("SELECT reloptions FROM pg_class", chosen)])
+            self.assertFalse(await agent_memory._ensure_trigram_fastupdate_off(conn))
+            self.assertEqual(conn.sql("execute"), [])
+
     async def test_maintained_counts_take_no_lock(self):
         conn = FakeConnection([("attname = 'event_count'", True)])
         result = await agent_memory.ensure_space_counts_async(conn)

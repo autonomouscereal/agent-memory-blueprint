@@ -160,6 +160,22 @@ class LiveSearchCacheTests(unittest.IsolatedAsyncioTestCase):
         entry = await cache_row(key_for(query, space=self.space_a))
         self.assertEqual((entry["revision"], entry["hit_count"]), (2, 1), "the straggler arrived as a delta")
 
+    async def test_init_writes_trigrams_directly_and_keeps_identity_statistics(self):
+        conn = await agent_memory.connect()
+        try:
+            options = await conn.fetchval(
+                "SELECT reloptions FROM pg_class WHERE relname = 'agent_memory_events_content_trgm_idx'")
+            stats = await conn.fetchval(
+                "SELECT stxkind::text FROM pg_statistic_ext WHERE stxname = 'agent_memory_events_identity_harness_model_stats'")
+        finally:
+            await conn.close()
+        self.assertIn("fastupdate=off", options)
+        # f: functional dependencies; e: the per-expression statistics PostgreSQL adds for expressions.
+        self.assertEqual(stats, "{f,e}")
+        await add(self.space_a, f"{self.marker} direct trigram write, Broken pipe")
+        rows = await agent_memory.grep_events_async("trigram write, Broken", space=self.space_a, limit=5, contains=True)
+        self.assertEqual(len(rows), 1)
+
     async def test_concurrent_writers_keep_exact_counts(self):
         await asyncio.gather(*(add(self.space_a, f"{self.marker} parallel {n}") for n in range(20)))
         self.assertEqual((await space_state(self.space_a))["inserted_rows"], 20)

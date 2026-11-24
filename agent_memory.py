@@ -744,6 +744,27 @@ async def _ensure_index_concurrently(conn: asyncpg.Connection, name: str, ddl: s
     await conn.execute(ddl)
 
 
+async def _ensure_trigram_fastupdate_off(conn: asyncpg.Connection) -> bool:
+    """Write the content trigram index directly instead of through a GIN pending list.
+
+    Every trigram scan (grep --contains) reads the whole pending list, about
+    1.3 ms per list page per 20k-id slice, so with the 4 MB default a slice
+    took about 0.9 s instead of 0.024 s in the lab; and the insert that fills
+    the list merges it in one transaction (100-200 MB of WAL, 1-14 s). Direct
+    writes cost about 8 ms per insert and 30% more WAL. Turned off once, with
+    one flush of the list it holds; an explicit fastupdate setting is kept.
+    ALTER INDEX takes ACCESS EXCLUSIVE on the index, so inserts wait for it.
+    """
+    options = await conn.fetchval(
+        "SELECT reloptions FROM pg_class WHERE oid = to_regclass('public.agent_memory_events_content_trgm_idx')"
+    )
+    if any(item.split("=", 1)[0] == "fastupdate" for item in options or []):
+        return False
+    await conn.execute("ALTER INDEX agent_memory_events_content_trgm_idx SET (fastupdate = off)")
+    await conn.fetchval("SELECT gin_clean_pending_list('agent_memory_events_content_trgm_idx'::regclass)")
+    return True
+
+
 SPACE_COUNT_TRIGGERS = ("agent_memory_events_count_insert_trg", "agent_memory_events_count_mutation_trg")
 # Identity fields audit can filter on; each gets a partial btree (field, created_at DESC).
 IDENTITY_AUDIT_KEYS = ("harness", "model_provider", "model_id", "thread_id")
@@ -1257,7 +1278,7 @@ async def init_db_async(*, recount_spaces: bool = False) -> dict[str, Any]:
             """,
             """
             CREATE INDEX IF NOT EXISTS agent_memory_events_content_trgm_idx
-            ON agent_memory_events USING GIN (content gin_trgm_ops)
+            ON agent_memory_events USING GIN (content gin_trgm_ops) WITH (fastupdate = off)
             """,
             """
             CREATE INDEX IF NOT EXISTS agent_memory_events_embedding_idx
@@ -1313,6 +1334,15 @@ async def init_db_async(*, recount_spaces: bool = False) -> dict[str, Any]:
             await _execute_ddl(conn, sql)
         for table in ("agent_memory_events", "agent_memory_payload_archives"):
             await _ensure_autovacuum_options(conn, table)
+        trigram_direct = await _ensure_trigram_fastupdate_off(conn)
+        # Two identity fields in one audit (harness + model_id): without these
+        # statistics the planner multiplied their selectivities, guessed 38
+        # rows for 67,703 and sorted them all (2.5 s). ANALYZE fills them.
+        await _execute_ddl(conn, """
+            CREATE STATISTICS IF NOT EXISTS agent_memory_events_identity_harness_model_stats (dependencies)
+            ON (metadata->'identity'->>'harness'), (metadata->'identity'->>'model_id')
+            FROM agent_memory_events
+        """)
         await _execute_ddl(conn, """
             CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_memory_events_identity_gin_idx
             ON agent_memory_events USING GIN ((metadata->'identity'))
@@ -1331,7 +1361,8 @@ async def init_db_async(*, recount_spaces: bool = False) -> dict[str, Any]:
                 ON agent_memory_events ((metadata->'identity'->>'{key}'), created_at DESC)
                 WHERE (metadata->'identity'->>'{key}') IS NOT NULL
             """)
-        return {"ok": True, "message": "agent_memory_events schema ready", "driver": "asyncpg", **space_counts}
+        return {"ok": True, "message": "agent_memory_events schema ready", "driver": "asyncpg", **space_counts,
+                "trigram_fastupdate_turned_off": trigram_direct}
     finally:
         await conn.close()
 
