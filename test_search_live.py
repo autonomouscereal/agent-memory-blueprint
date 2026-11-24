@@ -257,6 +257,27 @@ class LiveSpaceCountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["content"] for row in rows], [f"{self.marker} identity 2", f"{self.marker} identity 1"])
         rows = await agent_memory.audit_events_async(limit=5, session_id="no-such-session", all_spaces=True)
         self.assertEqual(rows, [])
+        model = f"live-model-{self.marker}"
+        await add(self.space_b, f"{self.marker} model row",
+                  metadata={"identity": {"harness": harness, "model_id": model, "model_provider": "live-test",
+                                         "thread_id": f"thread-{self.marker}"}})
+        rows = await agent_memory.audit_events_async(limit=5, harness=harness, model_id=model, all_spaces=True)
+        self.assertEqual([row["content"] for row in rows], [f"{self.marker} model row"])
+        rows = await agent_memory.audit_events_async(limit=5, thread_id=f"thread-{self.marker}", provider="live-test",
+                                                     all_spaces=True)
+        self.assertEqual(len(rows), 1)
+        conn = await agent_memory.connect()
+        try:
+            indexes = await conn.fetch(
+                """SELECT c.relname, i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+                   WHERE c.relname LIKE 'agent_memory_events_identity_%_idx' AND c.relname <> 'agent_memory_events_identity_gin_idx'
+                   ORDER BY c.relname""")
+        finally:
+            await conn.close()
+        self.assertEqual([(r["relname"], r["indisvalid"]) for r in indexes], [
+            ("agent_memory_events_identity_harness_idx", True), ("agent_memory_events_identity_model_id_idx", True),
+            ("agent_memory_events_identity_model_provider_idx", True), ("agent_memory_events_identity_thread_id_idx", True),
+        ])
 
 
 if __name__ == "__main__":

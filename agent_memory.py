@@ -728,6 +728,8 @@ async def _ensure_index_concurrently(conn: asyncpg.Connection, name: str, ddl: s
 
 
 SPACE_COUNT_TRIGGERS = ("agent_memory_events_count_insert_trg", "agent_memory_events_count_mutation_trg")
+# Identity fields audit can filter on; each gets a partial btree (field, created_at DESC).
+IDENTITY_AUDIT_KEYS = ("harness", "model_provider", "model_id", "thread_id")
 
 
 async def space_counts_maintained(conn: asyncpg.Connection) -> bool:
@@ -1306,6 +1308,12 @@ async def init_db_async(*, recount_spaces: bool = False) -> dict[str, Any]:
             ON agent_memory_events (session_id, created_at DESC)
             WHERE session_id IS NOT NULL
         """)
+        for key in IDENTITY_AUDIT_KEYS:
+            await _ensure_index_concurrently(conn, f"agent_memory_events_identity_{key}_idx", f"""
+                CREATE INDEX CONCURRENTLY agent_memory_events_identity_{key}_idx
+                ON agent_memory_events ((metadata->'identity'->>'{key}'), created_at DESC)
+                WHERE (metadata->'identity'->>'{key}') IS NOT NULL
+            """)
         return {"ok": True, "message": "agent_memory_events schema ready", "driver": "asyncpg", **space_counts}
     finally:
         await conn.close()
@@ -3270,11 +3278,16 @@ async def audit_events_async(
         filters.append(f"space = ${idx}")
         params.append(normalize_space(space))
         idx += 1
-    identity_filter = {key: value for key, value in (("model_id", model_id), ("harness", harness), ("thread_id", thread_id), ("model_provider", provider)) if value}
-    if identity_filter:
-        filters.append(f"metadata ? 'identity' AND metadata->'identity' @> ${idx}::jsonb")
-        params.append(identity_filter)
-        idx += 1
+    # One equality per identity field, served by that field's btree
+    # (IDENTITY_AUDIT_KEYS) in created_at order. The containment test used
+    # before (metadata->'identity' @> {...}) has no statistics, so the plan
+    # flipped between a bitmap over every match (harness=claude_code, 469k
+    # rows: 18.6 s) and a newest-first walk (seconds for a rare or old value).
+    for key, value in (("model_id", model_id), ("harness", harness), ("thread_id", thread_id), ("model_provider", provider)):
+        if value:
+            filters.append(f"(metadata->'identity'->>'{key}') = ${idx}")
+            params.append(value)
+            idx += 1
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
     params.append(limit)
     sql = f"""

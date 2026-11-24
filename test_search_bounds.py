@@ -400,6 +400,24 @@ def audit_row(row_id):
 
 
 class AuditTests(unittest.IsolatedAsyncioTestCase):
+    async def test_identity_filters_are_one_equality_per_field(self):
+        conn = FakeConnection([("ORDER BY created_at DESC", [audit_row(9)])])
+        with patch.object(agent_memory, "connect", AsyncMock(return_value=conn)):
+            rows = await agent_memory.audit_events_async(
+                limit=5, harness="codex", model_id="gpt-6-astra", provider="openai", thread_id="t1", all_spaces=True,
+            )
+        self.assertEqual([row["id"] for row in rows], [9])
+        sql = conn.sql("fetch")[0]
+        self.assertIn(
+            "WHERE (metadata->'identity'->>'model_id') = $1 AND (metadata->'identity'->>'harness') = $2 "
+            "AND (metadata->'identity'->>'thread_id') = $3 AND (metadata->'identity'->>'model_provider') = $4", sql)
+        self.assertNotIn("@>", sql)
+        args = [args for kind, _sql, args in conn.calls if kind == "fetch"][0]
+        self.assertEqual(args, ("gpt-6-astra", "codex", "t1", "openai", 5))
+
+    def test_every_audit_identity_field_has_an_index(self):
+        self.assertEqual(agent_memory.IDENTITY_AUDIT_KEYS, ("harness", "model_provider", "model_id", "thread_id"))
+
     async def test_session_audit_runs_one_plain_query(self):
         conn = FakeConnection([("ORDER BY created_at DESC", [audit_row(3)])])
         with patch.object(agent_memory, "connect", AsyncMock(return_value=conn)):
