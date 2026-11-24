@@ -135,6 +135,14 @@ has a five-second statement timeout. `status --details` computes exact counts,
 archive totals, top spaces, and all breakdown rows with a two-minute timeout per
 query. Use detailed accounting deliberately, rather than as a liveness probe.
 
+`spaces` lists each space with an exact `event_count` that row triggers keep in
+`agent_memory_space_search_state`, so listing never scans the events table.
+`init` installs the triggers and counts every space once under a SHARE lock on
+the events table (inserts wait for that count, a few seconds at 1.5M rows;
+reads don't). `init --recount-spaces` recounts the same way, for example after
+a TRUNCATE, which row triggers don't see. `status` shows
+`space_counts: maintained` once the triggers are in place.
+
 `self-test` checks the initialized schema through bounded catalog reads, then
 runs its insert, search, isolation, and graph checks. It never runs schema DDL.
 If the schema is missing or outdated it exits unsuccessfully with the missing
