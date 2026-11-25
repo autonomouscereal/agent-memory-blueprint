@@ -66,6 +66,7 @@ DB, and `status` reported a stale dump on the share with "alert: none". With the
 | `MIN_SYSTEM_FREE_KB` / `FREE_CHECK_PATHS` | 20 GB / `/` and `LOCAL_STAGING` | No staging and no copy step below this free space |
 | `LOCAL_MIN_FREE_KB` / `MIN_DEST_FREE_KB` | 60 GiB / 1 GiB | Free space kept beyond the expected dump on the stage and the share |
 | `STATE_DIR`, `LOG_DIR`, `LOCK_FILE` | under `$HOME/agent-memory-backup/` | State, logs, the run lock `backup-v2.lock` |
+| `SHARE_COPY_LOCK` / `SHARE_WAIT_LOCK` | `share-copy.lock` / `share-copy-wait.lock` beside `LOCK_FILE` | Held while a job writes to the share / held shared by a `backup_pg_db.sh` copy that waits for it |
 | `STAGING_DRIVE` | `$HOME` | Restore test: the drive that holds `LOCAL_STAGING` (its image goes there) |
 | `SERVING_UNIT` | empty | Restore test: a systemd unit whose answer speed it watches (see below) |
 
@@ -136,7 +137,7 @@ for ten days once filled the share with 38 dumps.
 | 0 | Published; exactly one verified backup kept; alert cleared |
 | 1 | Failed; previous backup kept; alert raised |
 | 3 | Published and verified, but a superseded or stale path could not be deleted; warning alert |
-| 4 | The paced copy paused at the end of its window (or the pool stayed BUSY, or free space fell under the floor); partial and verified stage kept for the next run; previous backup kept; warning alert |
+| 4 | The paced copy paused at the end of its window (or the pool stayed BUSY, free space fell under the floor, or a waiting `backup_pg_db.sh` copy kept the share); partial and verified stage kept for the next run; previous backup kept; warning alert |
 | 75 | Another run holds `backup-v2.lock` |
 
 Alerts go to `state/alert.json` (the current one; a clean run removes it), `state/alerts.log` (history), the
@@ -173,9 +174,29 @@ changed; dump, verify, publish and delete-after-publish are as before.
   partial; the final SHA-256 and `pg_restore --list` still decide, and a bad partial is deleted and copied again.
 - No staging and no copy step while `/` or the staging drive has under `MIN_SYSTEM_FREE_KB` (20 GB) free: exit 1 at
   preflight (naming the path), a pause with exit 4 during a copy.
-- The copy holds `SHARE_COPY_LOCK` (`share-copy.lock` beside the run lock) for its whole length, and so does
-  `backup_pg_db.sh` for its NAS copy, so the two jobs never write to the share at the same time.
 - 37 GB at 6000 KiB/s is about 1 h 45 min of copy.
+
+### Share-copy lock and `backup_pg_db.sh` (3.2.3)
+
+The two jobs never write to the share at the same time: each writes only while it holds `SHARE_COPY_LOCK`
+(`share-copy.lock` beside the run lock). Since 3.2.3 (and `backup_pg_db.sh` 2.2.0) the memory copy holds it only
+while it writes, so the small copy runs in the memory copy's waits:
+
+- The memory copy releases the lock for every pool wait. A `backup_pg_db.sh` copy blocked on it wakes at once,
+  reads the pool state itself and copies once it reads OK.
+- A waiting `backup_pg_db.sh` copy takes `SHARE_WAIT_LOCK` (`share-copy-wait.lock`) shared before it asks for the
+  share-copy lock, and drops it only after it has released the share-copy lock. Before each step the memory copy
+  tries `SHARE_WAIT_LOCK` exclusively. If the try fails, it releases the share-copy lock, blocks in `flock` until the
+  other copy has finished, then reads the window, free space and pool state again and takes the lock back.
+- Both sides block in `flock`, so neither one polls the other, and the memory copy never blocks on the wait lock
+  while it holds the share-copy lock, so they cannot deadlock.
+- After the last step the memory copy keeps the lock until the manifest and restore list are on the share too (3.2.2
+  wrote them after releasing it). The verify that follows only reads the share.
+- A waiting copy keeps its turn through its own pool waits. If it still holds it at the end of the window, the
+  memory copy pauses (exit 4, "a waiting backup_pg_db.sh copy kept the share until the end of the copy window")
+  and resumes the next night.
+- On 11-25 each 10-minute step was followed by a BUSY read and a 15-minute wait. The 3.2.2 job held the lock
+  through all nine waits, so a `backup_pg_db.sh` copy waited from 09:51 to 13:00Z and was skipped.
 
 ### Safety point when the share is down
 
@@ -271,7 +292,9 @@ hold at least the manifest counts.
   days (`KEEP_DAILY`), of the 8 most recent ISO weeks (`KEEP_WEEKLY`) and everything younger than 48 h
   (`KEEP_RECENT_HOURS`), on both copies.
 - The NAS copy (`$MIRROR_ROOT/<db>`) has the agent-memory job's protection: only inside `TRANSFER_WINDOW_UTC`, at
-  `BWLIMIT_KBPS`, after the pool gate, and only while holding `SHARE_COPY_LOCK`. A copy that cannot start before the
+  `BWLIMIT_KBPS`, after the pool gate, and only while holding `SHARE_COPY_LOCK`. Since 2.2.0 it holds
+  `SHARE_WAIT_LOCK` shared while it waits and copies, so the agent-memory copy hands the share over at its next pool
+  wait or step (see "Share-copy lock and `backup_pg_db.sh`" above). A copy that cannot start before the
   window ends is skipped (`nas=skipped-...` in the log; the local copy is the restore point) and the next run copies
   the newest `MIRROR_CATCHUP_MAX` (3) local backups the share is missing. A full or missing share never fails the
   backup. `DB_NAME=<db> backup_pg_db.sh mirror` runs only the NAS copy.

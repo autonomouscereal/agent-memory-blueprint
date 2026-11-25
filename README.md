@@ -229,7 +229,8 @@ database, with raw `pg_dump` / `pg_restore` / `psql` inside the container and no
 - **Proven restorable.** A weekly test restores the published dump into a throwaway container and compares exact row
   counts with the live database.
 - **Siblings.** `backup_pg_db.sh` covers the smaller databases in the same container (snapshot dump, exact restore
-  test, daily/weekly rotation), and never copies to the share while the memory backup does.
+  test, daily/weekly rotation). It never writes to the share while the memory backup writes; it gets the share during
+  the memory backup's pool waits and between its steps.
 
 A machine's own paths go in `agent-memory-backup.env` / `pg-db-backup.env` beside the installed scripts (templates
 in [`scripts/`](skills/agent-memory-backup/scripts/)); they are gitignored like `.env`. Both test suites run on Linux

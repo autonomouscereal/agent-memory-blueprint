@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Tests for backup_pg_db.sh 2.1.x's NAS-copy guards (2026-11-24): the copy window, the pool gate, the
-# share-copy lock shared with backup_agent_memory_pg.sh, --bwlimit, the 20 GB free-space floor and the catch-up of
-# skipped copies. Uses the `mirror` command on a fake local backup tree with random dumps; a tiny fake docker serves
-# the run path's first checks. Everything lives in a temp dir; no real backup path is touched.
+# share-copy lock shared with backup_agent_memory_pg.sh (and 2.2.0's wait lock beside it), --bwlimit, the 20 GB
+# free-space floor and the catch-up of skipped copies. The hand-over between the two jobs is tested with both real
+# scripts in test_backup_agent_memory_pg.sh, section 23. Uses the `mirror` command on a fake local backup tree with
+# random dumps; a tiny fake docker serves the run path's first checks. Everything lives in a temp dir; no real backup
+# path is touched.
 #   bash scripts/tests/test_backup_pg_db.sh [path/to/backup_pg_db.sh]
 set -uo pipefail
 
@@ -198,6 +200,36 @@ check "no databases: run-all refuses an empty CRON_DBS (exit 1)" rc_is 1
 check "no databases: the refusal names the env file" grep -q "CRON_DBS is empty: list the databases in $E/fake/missing.env" "$OUT"
 run_cmd defaults restore-help -u DEST_ROOT PG_DB_BACKUP_ENV="$E/fake/missing.env"
 check "no env file: DEST_ROOT defaults under \$HOME" grep -q "D=$HOME/pg-db-backups/<db>/dumps/<backup_id>.dump" "$OUT"
+
+# 12. 2.2.0: while the copy waits for the share-copy lock it holds the wait lock shared (the agent-memory copy reads
+#     that as "hand the share over"), and both are free once it is done. A wait lock held exclusively past the
+#     deadline skips the copy without a write.
+new_env 12
+WL="$E/share-copy-wait.lock"
+make_backup 20261112T095000Z; H="$LAST"
+( flock 8; sleep 3 ) 8>>"$SHARE_COPY_LOCK" &
+HOLDER=$!
+sleep 0.5
+OUT="$E/fake/waitlock.out"
+bash "$SCRIPT" mirror > "$OUT" 2>&1 &
+MIRROR=$!
+for _ in $(seq 1 50); do grep -q 'waiting for the share-copy lock' "$OUT" && break; sleep 0.1; done
+check "wait lock: held while the copy waits for the share-copy lock" bash -c "! flock -n -x '$WL' true"
+check "wait lock: held shared (a second shared holder gets it)" flock -n -s "$WL" true
+wait "$MIRROR"; RC=$?
+wait "$HOLDER"
+check "wait lock: the copy then runs (exit 0)" rc_is 0
+check "wait lock: the dump is on the share" on_share "$H"
+check "wait lock: free once the copy is done" flock -n -x "$WL" true
+check "wait lock: the share-copy lock is free too" flock -n -x "$SHARE_COPY_LOCK" true
+make_backup 20261113T095000Z; H2="$LAST"
+( flock -x 8; sleep 6 ) 8>>"$WL" &
+sleep 0.5
+run_cmd waitheld mirror TRANSFER_DEADLINE_EPOCH=$(( $(date +%s) + 3 ))
+wait
+check "wait lock: held exclusively past the deadline exits 1" rc_is 1
+check "wait lock: the skip is logged" grep -q 'the share-copy wait lock stayed held until the window end' "$OUT"
+check "wait lock: nothing was written" not_on_share "$H2"
 
 echo "# passed $PASS failed $FAIL"
 [[ "$FAIL" == 0 ]]

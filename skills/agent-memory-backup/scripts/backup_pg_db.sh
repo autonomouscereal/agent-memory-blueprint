@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# backup_pg_db.sh 2.1.1 - verified pg_dump of one database in agent-memory-postgres.
+# backup_pg_db.sh 2.2.0 - verified pg_dump of one database in agent-memory-postgres.
 #
 # Sibling of backup_agent_memory_pg.sh for the smaller databases that share the container (CRON_DBS lists
 # them). agent_memory keeps its own job and script; this one never touches it unless DB_NAME=agent_memory is
@@ -35,9 +35,15 @@
 # MIRROR_CATCHUP_MAX local backups missing on the share). No staging (dump) while / or the local backup drive has
 # under 20 GB free. The gate, window, free-space and env-file helpers are copies of the ones in
 # backup_agent_memory_pg.sh: change both.
+#
+# 2.2.0 (2026-11-25): before it blocks on SHARE_COPY_LOCK, the NAS copy takes SHARE_WAIT_LOCK shared and keeps it
+# until it has released SHARE_COPY_LOCK. backup_agent_memory_pg.sh 3.2.3+ holds SHARE_COPY_LOCK only while it writes:
+# it releases it for every pool wait, and at each step it sees this shared lock and hands the share over. flock
+# wakes this job when the lock comes free, and it copies once its own pool gate reads OK. On 11-25 one database's
+# copy waited 09:51-13:00Z for the lock and was skipped.
 set -Eeuo pipefail
 
-VERSION="2.1.1"
+VERSION="2.2.0"
 
 # load_env_file <file>: the rules of load_env_file in backup_agent_memory_pg.sh (KEY=VALUE lines; a variable already
 # set in the environment wins over the file; nothing is expanded or executed).
@@ -95,6 +101,8 @@ PACE_BUSY_WAIT_SECONDS="${PACE_BUSY_WAIT_SECONDS:-900}"
 TRANSFER_WINDOW_UTC="${TRANSFER_WINDOW_UTC:-07:00-13:00}"
 TRANSFER_DEADLINE_EPOCH="${TRANSFER_DEADLINE_EPOCH:-}"
 SHARE_COPY_LOCK="${SHARE_COPY_LOCK:-$HOME/agent-memory-backup/share-copy.lock}"
+# 2.2.0: held shared while this job waits for and holds SHARE_COPY_LOCK (the same default as in the agent-memory job)
+SHARE_WAIT_LOCK="${SHARE_WAIT_LOCK:-${SHARE_COPY_LOCK%.lock}-wait.lock}"
 MIN_SYSTEM_FREE_KB="${MIN_SYSTEM_FREE_KB:-19531250}"
 FREE_CHECK_PATHS="${FREE_CHECK_PATHS:-/ $DEST_ROOT}"
 MIRROR_CATCHUP_MAX="${MIRROR_CATCHUP_MAX:-3}"
@@ -313,11 +321,18 @@ validate_guard_config() {
 
 MIRROR_STATE="not-run"
 SHARE_FD=""
+WAIT_FD=""
+# Release the share-copy lock, then (2.2.0) the wait lock, in that order: the agent-memory copy takes the share back
+# once the wait lock is free, so the share-copy lock must be free by then.
 share_lock_release() {
   if [[ -n "$SHARE_FD" ]]; then
     exec {SHARE_FD}>&-
     SHARE_FD=""
     log "share-copy lock released"
+  fi
+  if [[ -n "$WAIT_FD" ]]; then
+    exec {WAIT_FD}>&-
+    WAIT_FD=""
   fi
 }
 
@@ -367,13 +382,24 @@ mirror_copy() {
     MIRROR_STATE="verified"; log "NAS copy result: $id verified (copied 0, failed 0): already on the share"
     return 0
   fi
-  # Never at the same time as the agent-memory copy, which holds this lock for its whole transfer.
+  # Never at the same time as the agent-memory copy, which holds the share-copy lock while it writes. 2.2.0: the
+  # shared wait lock, taken first, tells it that this copy is waiting; it releases the share-copy lock at its next
+  # pool wait or step boundary and waits until both locks are free again.
+  exec {WAIT_FD}>>"$SHARE_WAIT_LOCK"
+  now="$(date +%s)"
+  if (( end <= now )) || ! flock -s -w $(( end - now )) "$WAIT_FD"; then
+    exec {WAIT_FD}>&-; WAIT_FD=""
+    MIRROR_STATE="skipped-share-busy"
+    log "WARNING: NAS copy skipped: the share-copy wait lock stayed held until the window end; the next run copies it"
+    return 0
+  fi
   exec {SHARE_FD}>>"$SHARE_COPY_LOCK"
   if ! flock -n "$SHARE_FD"; then
     now="$(date +%s)"
-    log "waiting for the share-copy lock (the agent-memory copy holds it), up to $(date -u -d "@$end" '+%H:%MZ')"
+    log "waiting for the share-copy lock (the agent-memory copy holds it and hands it over at its next pool wait or step), up to $(date -u -d "@$end" '+%H:%MZ')"
     if (( end <= now )) || ! flock -w $(( end - now )) "$SHARE_FD"; then
       exec {SHARE_FD}>&-; SHARE_FD=""
+      share_lock_release
       MIRROR_STATE="skipped-share-busy"
       log "WARNING: NAS copy skipped: the share-copy lock stayed held until the window end; the next run copies it"
       return 0
@@ -602,7 +628,7 @@ status() {
   done
   crontab -l 2>/dev/null | sed -n '/# BEGIN pg-db-backup/,/# END pg-db-backup/p' || true
   pool_state_ok || true
-  echo "NAS copy: --bwlimit=$BWLIMIT_KBPS KiB/s, window ${TRANSFER_DEADLINE_EPOCH:-$TRANSFER_WINDOW_UTC UTC}, pool state: $POOL_STATE_LINE, share-copy lock: $SHARE_COPY_LOCK"
+  echo "NAS copy: --bwlimit=$BWLIMIT_KBPS KiB/s, window ${TRANSFER_DEADLINE_EPOCH:-$TRANSFER_WINDOW_UTC UTC}, pool state: $POOL_STATE_LINE, share-copy lock: $SHARE_COPY_LOCK (wait lock $SHARE_WAIT_LOCK)"
 }
 
 restore_help() {

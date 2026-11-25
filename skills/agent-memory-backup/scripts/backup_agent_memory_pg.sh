@@ -27,9 +27,16 @@
 # 3.2.2 (2026-11-24): the machine's own values (mount point, staging drive, pool state file, cache wrapper) moved
 # out of this file into agent-memory-backup.env beside it (see agent-memory-backup.env.example). The defaults below
 # are generic.
+#
+# 3.2.3 (2026-11-25): the copy holds SHARE_COPY_LOCK only while it writes. It releases the lock for every pool wait,
+# and before each step it hands the share to a backup_pg_db.sh 2.2.0+ copy that is waiting for it (that job holds
+# SHARE_WAIT_LOCK shared while it waits and copies), then takes it back once that copy has finished. Both sides block
+# in flock, so the kernel wakes each one when the other releases. On 11-25 a backup_pg_db.sh copy waited from 09:51
+# to 13:00Z for the lock while this job held it through nine 15-minute BUSY waits, and it never ran. The manifest and
+# restore list are now copied under the lock as well; 3.2.2 wrote them after releasing it.
 set -Eeuo pipefail
 
-SCRIPT_VERSION="3.2.2"
+SCRIPT_VERSION="3.2.3"
 
 # load_env_file <file>: set each KEY=VALUE of <file> that is not already set, so a variable from the environment (a
 # cron line, a test, an operator's override) wins over the file. Blank lines and # comments are skipped, an
@@ -87,6 +94,9 @@ FREE_CHECK_PATHS="${FREE_CHECK_PATHS:-/ $LOCAL_STAGING}"
 # 3.2.1 (11-24): the two jobs that write to the share (this one and backup_pg_db.sh) never copy at the same time;
 # both hold this lock while they copy.
 SHARE_COPY_LOCK="${SHARE_COPY_LOCK:-$(dirname "$LOCK_FILE")/share-copy.lock}"
+# 3.2.3: backup_pg_db.sh holds this one shared from before it asks for SHARE_COPY_LOCK until after it has released
+# it; an exclusive try that fails tells this job that a copy is waiting.
+SHARE_WAIT_LOCK="${SHARE_WAIT_LOCK:-${SHARE_COPY_LOCK%.lock}-wait.lock}"
 SHARE_FD=""
 CRON_SCHEDULE="${CRON_SCHEDULE:-20 2 * * *}"
 # Cache discipline (a host memory policy, 2026-11-04): install-cron puts CACHE_WRAP in front of the runner when its
@@ -175,7 +185,8 @@ script (AGENT_MEMORY_BACKUP_ENV names another file). The environment wins over t
   RESUME_TRIM_BYTES      Bytes cut off a partial before it is resumed. Default: 67108864
   MIN_SYSTEM_FREE_KB     No staging or copy step while a FREE_CHECK_PATHS entry has less free. Default: 19531250 (20 GB)
   FREE_CHECK_PATHS       Paths checked for MIN_SYSTEM_FREE_KB. Default: / and LOCAL_STAGING
-  SHARE_COPY_LOCK        Held for the whole copy; backup_pg_db.sh takes it too. Default: beside LOCK_FILE
+  SHARE_COPY_LOCK        Held while a copy step writes; backup_pg_db.sh takes it too. Default: beside LOCK_FILE
+  SHARE_WAIT_LOCK        Held shared by a waiting backup_pg_db.sh copy. Default: SHARE_COPY_LOCK with -wait.lock
   LOCAL_STAGING          Where the dump is staged. Default: $HOME/agent-memory-backup/staging
   DEST_ROOT              Where the verified backup is published. Default: $MOUNTPOINT/backups/agent-memory-postgres
   CRON_SCHEDULE          Cron schedule. Default: 20 2 * * *
@@ -488,46 +499,78 @@ run_step() {
   return "$status"
 }
 
-# 3.2.1: the share-copy lock, shared with backup_pg_db.sh 2.1.0+, is held for the whole
-# copy, so the two jobs never copy to the share at the same time. paced_copy waits for it up to the end of the copy
-# window (a pause with exit 4 if it never comes), runs paced_copy_inner, and releases it on every return.
-paced_copy() {
-  local lend lnow rc=0
+# 3.2.3: release the share-copy lock if this job holds it, by closing its descriptor (a copy step's rsync, which
+# inherits it, has exited by then). A backup_pg_db.sh copy blocked in flock on the lock wakes at once.
+#   share_lock_release [why]
+share_lock_release() {
+  [[ -n "$SHARE_FD" ]] || return 0
+  exec {SHARE_FD}>&-
+  SHARE_FD=""
+  log "share-copy lock released${1:+ $1}"
+}
+
+# 3.2.3: hold the share-copy lock for the next step, unless a backup_pg_db.sh copy is waiting for the share: then
+# release it, block until that copy has finished, and let the caller read the window, free space and pool state
+# again. The waiting copy holds SHARE_WAIT_LOCK shared from before it asks for the share-copy lock until after it
+# has released it, so the exclusive try below fails exactly while one waits or copies. This job never blocks on
+# SHARE_WAIT_LOCK while it holds the share-copy lock, so the two jobs cannot deadlock.
+#   share_turn <end of the copy window, epoch>
+# Returns 0 holding the lock, 2 after a waiting copy had its turn, or 1 when the window ended first (PAUSE_REASON
+# says why).
+share_turn() {
+  local end="$1" now wait_fd
+  exec {wait_fd}>>"$SHARE_WAIT_LOCK"
+  if ! flock -n -x "$wait_fd"; then
+    share_lock_release "for a waiting backup_pg_db.sh copy"
+    now="$(date +%s)"
+    log "a backup_pg_db.sh copy is waiting for the share; it goes first (this copy waits up to $(date -u -d "@$end" '+%H:%MZ'))"
+    if (( end <= now )) || ! flock -x -w $(( end - now )) "$wait_fd"; then
+      exec {wait_fd}>&-
+      PAUSE_REASON="a waiting backup_pg_db.sh copy kept the share until the end of the copy window"
+      return 1
+    fi
+    exec {wait_fd}>&-
+    log "the waiting backup_pg_db.sh copy has finished"
+    return 2
+  fi
+  exec {wait_fd}>&-
+  [[ -z "$SHARE_FD" ]] || return 0
   exec {SHARE_FD}>>"$SHARE_COPY_LOCK"
   if ! flock -n "$SHARE_FD"; then
-    lend="$(transfer_window_end)"; lnow="$(date +%s)"
-    log "waiting for the share-copy lock (backup_pg_db.sh's NAS copy holds it)$( (( lend > lnow )) && echo ", up to $(date -u -d "@$lend" '+%H:%MZ')")"
-    if (( lend <= lnow )) || ! flock -w $(( lend - lnow )) "$SHARE_FD"; then
+    now="$(date +%s)"
+    log "waiting for the share-copy lock (backup_pg_db.sh's NAS copy holds it), up to $(date -u -d "@$end" '+%H:%MZ')"
+    if (( end <= now )) || ! flock -w $(( end - now )) "$SHARE_FD"; then
       exec {SHARE_FD}>&-; SHARE_FD=""
       PAUSE_REASON="the share-copy lock stayed held until the end of the copy window"
-      return "$EXIT_PAUSED"
+      return 1
     fi
   fi
   log "share-copy lock taken"
+}
+
+# 3.2.1: the share-copy lock, shared with backup_pg_db.sh 2.1.0+, keeps the two jobs from copying to the share at
+# the same time. 3.2.3: it is held only while this job writes. share_turn takes it before each step, paced_copy_inner
+# releases it for each pool wait, and paced_copy releases it when the copy pauses or fails. After a complete copy
+# the caller keeps it for the manifest and restore list and then releases it (3.2.2 wrote those two files after it
+# had released the lock).
+paced_copy() {
+  local rc=0
   paced_copy_inner "$@" || rc=$?
-  exec {SHARE_FD}>&-; SHARE_FD=""
-  log "share-copy lock released"
+  (( rc == 0 )) || share_lock_release
   return "$rc"
 }
 
 # 3.2.0: copy <src> into <dest_dir>/ in paced, gated steps.
 #   paced_copy_inner <src> <dest_dir> <resume: 1 when the partial there comes from a paused run>
 # Returns 0 when rsync reports the copy complete, EXIT_PAUSED when the window ended first (PAUSE_REASON says
-# why), or the rsync status of a fatal failure.
+# why), or the rsync status of a fatal failure. 3.2.3: every write to the partial, the first trim included, happens
+# after share_turn has returned 0.
 paced_copy_inner() {
   local src="$1" dest_dir="$2" resume="$3"
   local dest src_size dest_size before after end now secs wait_s step=0 status errfile t0 eagain=0 transient=0
+  local first=1 turn
   dest="$dest_dir/$(basename "$src")"
   src_size="$(stat -c '%s' "$src")"
-  if [[ -e "$dest" ]]; then
-    dest_size="$(stat -c '%s' "$dest")"
-    if (( dest_size > src_size )); then
-      log "the partial copy is larger than the source ($dest_size > $src_size bytes); starting it over"
-      rm -f -- "$dest"
-    elif [[ "$resume" == "1" ]] && (( dest_size < src_size )); then
-      trim_partial "$dest" || return 1
-    fi
-  fi
   errfile="$(mktemp)"
   while true; do
     end="$(transfer_window_end)"
@@ -551,11 +594,31 @@ paced_copy_inner() {
     if ! pool_state_ok; then
       wait_s=$(( end - now ))
       (( wait_s > PACE_BUSY_WAIT_SECONDS )) && wait_s="$PACE_BUSY_WAIT_SECONDS"
+      # 3.2.3: a waiting backup_pg_db.sh copy may use the share during the wait; it reads the pool state itself.
+      share_lock_release "for the pool wait"
       log "pool not OK, no write: $POOL_STATE_LINE; reading it again in ${wait_s}s"
       sleep "$wait_s"
       continue
     fi
+    turn=0
+    share_turn "$end" || turn=$?
+    (( turn == 2 )) && continue
+    (( turn == 0 )) || break
+    if (( first == 1 )); then
+      first=0
+      if [[ -e "$dest" ]]; then
+        dest_size="$(stat -c '%s' "$dest")"
+        if (( dest_size > src_size )); then
+          log "the partial copy is larger than the source ($dest_size > $src_size bytes); starting it over"
+          rm -f -- "$dest"
+        elif [[ "$resume" == "1" ]] && (( dest_size < src_size )); then
+          trim_partial "$dest" || { rm -f "$errfile"; return 1; }
+        fi
+      fi
+    fi
+    now="$(date +%s)"
     secs=$(( end - now ))
+    (( secs > 0 )) || continue
     (( secs > PACE_STEP_SECONDS )) && secs="$PACE_STEP_SECONDS"
     step=$((step + 1))
     before="$(stat -c '%s' "$dest" 2>/dev/null || echo 0)"
@@ -1127,6 +1190,8 @@ EOF
   rm -f -- "$PAUSED_FILE"
   rsync_with_retry -a --inplace --whole-file --ignore-times "$tmp_manifest" "$tmp_restore_list" "$dest_incoming/" ||
     die "transfer of the manifest/restore list failed"
+  # 3.2.3: every file of the backup is on the share; the verify below only reads it.
+  share_lock_release
 
   PHASE="verify-destination"
   cmp -s "$tmp_manifest" "$dest_incoming/${backup_id}.manifest.json" || die "destination manifest differs from the staged manifest"
@@ -1175,6 +1240,7 @@ dry_run_report() {
   pool_state_ok || true
   wend="$(transfer_window_end)"
   log "DRY-RUN copy plan: --bwlimit=$BWLIMIT_KBPS KiB/s, steps of ${PACE_STEP_SECONDS}s, window ${TRANSFER_DEADLINE_EPOCH:+deadline }${TRANSFER_DEADLINE_EPOCH:-$TRANSFER_WINDOW_UTC UTC} ($([[ "$wend" != 0 ]] && echo "open until $(date -u -d "@$wend" '+%H:%MZ')" || echo 'closed now: a run would pause without writing')), pool state now: $POOL_STATE_LINE"
+  log "DRY-RUN share: $SHARE_COPY_LOCK is held only while a step writes and is released for each pool wait; a backup_pg_db.sh copy waiting on $SHARE_WAIT_LOCK goes first at the next step"
   if [[ -n "$latest" ]]; then
     if [[ "$DRY_RUN_HASH" == "1" ]]; then
       PHASE="verify-published"

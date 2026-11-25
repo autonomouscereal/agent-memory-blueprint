@@ -67,8 +67,17 @@ cat > "$WORK/bin/rsync" <<SHIM
 #!/usr/bin/env bash
 # rsync wrapper: FAKE_RSYNC_CORRUPT=1 flips the last byte of a transferred .dump (same size);
 # FAKE_RSYNC_FAIL=<code> copies half of a .dump then exits <code>.
+# FAKE_RSYNC_LOG=<file> (3.2.3 tests): appends "start|end <epoch.ns> <destination> <.dump source or ->" around every
+# call, a stopped step included, so a test can check that two jobs never wrote to the share at the same time.
 args=("\$@"); src=""; dst="\${args[-1]}"
 for a in "\${args[@]}"; do [[ "\$a" == *.dump ]] && src="\$a"; done
+if [[ -n "\${FAKE_RSYNC_LOG:-}" ]]; then
+  printf 'start %s %s %s\n' "\$(date +%s.%N)" "\$dst" "\${src:--}" >> "\$FAKE_RSYNC_LOG"
+  trap 'printf "end %s %s %s\n" "\$(date +%s.%N)" "\$dst" "\${src:--}" >> "\$FAKE_RSYNC_LOG"' EXIT
+  trap 'exit 143' TERM
+fi
+# FAKE_RSYNC_META_SLEEP=<s>: a call without a .dump (the manifest and restore list) takes <s> seconds longer.
+if [[ -n "\${FAKE_RSYNC_META_SLEEP:-}" && -z "\$src" ]]; then sleep "\$FAKE_RSYNC_META_SLEEP"; fi
 if [[ -n "\${FAKE_RSYNC_FAIL:-}" && -n "\$src" ]]; then
   head -c 1000 "\$src" > "\$dst/\$(basename "\$src")"; exit "\$FAKE_RSYNC_FAIL"
 fi
@@ -540,7 +549,7 @@ check "free space: with space back the run exits 0" rc_is 0
 check "free space: it publishes the paused backup" pointer_is "$M_ID"
 check "free space: the published copy matches its sha256" published_sha_matches
 
-# 21. 3.2.1: the share-copy lock, shared with backup_pg_db.sh, is held for the whole copy.
+# 21. 3.2.1: the share-copy lock, shared with backup_pg_db.sh, is held while the copy writes (3.2.3: only then, 23).
 new_env 21
 run_job l_base run FAKE_DUMP_SEED=60; OUT="$E/fake/l_base.out"
 check "share lock: baseline run exits 0" rc_is 0
@@ -631,6 +640,158 @@ OUT="$E/fake/f_defaults.out"
 env -u MOUNTPOINT -u DEST_ROOT AGENT_MEMORY_BACKUP_ENV="$E/fake/missing.env" bash "$SCRIPT" restore-help > "$OUT" 2>&1; RC=$?
 check "no env file: restore-help exits 0" rc_is 0
 check "no env file: DEST_ROOT defaults to /mnt/nas/backups/agent-memory-postgres" grep -q '/mnt/nas/backups/agent-memory-postgres/latest_backup_id.txt' "$OUT"
+
+# 23. 3.2.3: this job holds the share-copy lock only while it writes, so a backup_pg_db.sh copy that waits for the
+#     share runs during this job's pool wait (23a) or at its next step boundary (23b), and the two never write to
+#     the share at the same time. A waiting copy that keeps the share until the deadline pauses this job without a
+#     write, and the next run resumes it (23c). Both real scripts, one share, one pair of locks, one pool state file.
+PGDB_SCRIPT="$(dirname "$SCRIPT")/backup_pg_db.sh"
+if [[ -f "$PGDB_SCRIPT" ]]; then
+  new_env 23
+  BD="$E/pgdb"; mkdir -p "$BD/local/labdb/dumps" "$BD/local/labdb/manifests" "$BD/local/labdb/restore-lists" \
+    "$BD/locks" "$BD/logs" "$MOUNTPOINT/backups"
+  RL="$E/fake/rsync.log"; : > "$RL"
+  # pgdb_backup <stamp>: a published local labdb backup (random dump, sidecar, manifest, restore list) for the mirror
+  pgdb_backup() {
+    local id="labdb_$1" d="$BD/local/labdb"
+    head -c 300000 /dev/urandom > "$d/dumps/$id.dump"
+    (cd "$d/dumps" && sha256sum "$id.dump" > "$id.dump.sha256")
+    printf '{"backup_id": "%s"}\n' "$id" > "$d/manifests/$id.manifest.json"
+    printf ';\n; TOC Entries: 1\n' > "$d/restore-lists/$id.restore.list"
+    printf '%s\n' "$id" > "$d/latest_backup_id.txt"
+    PG_ID="$id"
+  }
+  pg_on_share() { (cd "$MOUNTPOINT/backups/pg-db-postgres/labdb" 2>/dev/null && sha256sum --quiet -c "$1.dump.sha256" 2>/dev/null); }
+  # pgdb_mirror <name> [VAR=value ...]: `backup_pg_db.sh mirror` in the background on this env's share, locks and pool
+  # state; its exit code lands in fake/<name>.rc
+  pgdb_mirror() {
+    local name="$1"; shift
+    ( env PG_DB_BACKUP_ENV="$WORK/empty.env" DB_NAME=labdb RECORD_RUN=0 DEST_ROOT="$BD/local" \
+        MIRROR_ROOT="$MOUNTPOINT/backups/pg-db-postgres" LOG_DIR="$BD/logs" LOG_FILE="$BD/logs/pg.log" \
+        LOCK_DIR="$BD/locks" SHARE_COPY_LOCK="$E/share-copy.lock" POOL_STATE_FILE="$MOUNTPOINT/.nas-tuning/pool_state" \
+        MIN_MIRROR_FREE_KB=0 FREE_CHECK_PATHS=/ PACE_BUSY_WAIT_SECONDS=1 BWLIMIT_KBPS=6000 FAKE_RSYNC_LOG="$RL" "$@" \
+        bash "$PGDB_SCRIPT" mirror > "$E/fake/$name.out" 2>&1; echo $? > "$E/fake/$name.rc" ) &
+    PG_BG=$!
+  }
+  # am_run <name> [VAR=value ...]: this script's run in the background; its exit code lands in fake/<name>.rc
+  am_run() {
+    local name="$1"; shift
+    rm -f "$E/fake/pg_restore_calls"; sleep 1.1
+    ( env FAKE_RSYNC_LOG="$RL" "$@" bash "$SCRIPT" run > "$E/fake/$name.out" 2>&1; echo $? > "$E/fake/$name.rc" ) &
+    AM_BG=$!
+  }
+  # wait_line <file> <text> [seconds]: until a job's output has the line (the suites' short wait loop)
+  wait_line() { local i; for i in $(seq 1 $(( ${3:-30} * 10 ))); do grep -qF -- "$2" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
+  rc_file_is() { [[ "$(cat "$E/fake/$1.rc" 2>/dev/null)" == "$2" ]]; }
+  # no_overlap [from line]: no rsync into the pg-db share dir ran while one into incoming/ ran (FAKE_RSYNC_LOG
+  # intervals, from line <n> on)
+  no_overlap() {
+    tail -n +"${1:-1}" "$RL" | sort -k2,2n | awk '{ c = ($3 ~ /\/incoming\//) ? "am" : (($3 ~ /pg-db-postgres/) ? "pg" : "") }
+      c == "" { next }
+      $1 == "start" { o = (c == "am") ? "pg" : "am"; if (open[o] > 0) bad = 1; open[c]++ }
+      $1 == "end" { open[c]-- }
+      END { exit bad }'
+  }
+  # pg_before_am_end <from line>: the pg-db copy logged after line <n> ended before this job's last dump step started
+  pg_before_am_end() {
+    tail -n +"$1" "$RL" | awk '$1 == "end" && $3 ~ /pg-db-postgres/ && $2 > pe { pe = $2 }
+      $1 == "start" && $3 ~ /\/incoming\// && $4 ~ /\.dump$/ && $2 > as { as = $2 }
+      END { exit !(pe > 0 && as > pe) }'
+  }
+
+  # 23a. The pool reads BUSY after a step: this job releases the lock for its wait, the pg-db copy (started during
+  #      the wait) takes it at once, waits out one BUSY read itself, copies when the pool reads OK, and this job
+  #      takes the lock back after its wait and publishes.
+  FROM=$(( $(wc -l < "$RL") + 1 ))
+  am_run h_busy FAKE_DUMP_SEED=80 FAKE_DUMP_LINES=60000 BWLIMIT_KBPS=40 PACE_STEP_SECONDS=2 PACE_BUSY_WAIT_SECONDS=6
+  wait_line "$E/fake/h_busy.out" 'share-copy lock taken'
+  pool_state BUSY
+  wait_line "$E/fake/h_busy.out" 'pool not OK, no write: BUSY'
+  pgdb_backup 20261125T095001Z; PG_A="$PG_ID"
+  pgdb_mirror h_busy_pg
+  wait_line "$E/fake/h_busy_pg.out" 'pool not OK, no NAS write: BUSY' 10
+  pool_state OK
+  wait "$PG_BG" "$AM_BG"
+  OUT="$E/fake/h_busy.out"
+  check "hand-over (pool wait): the agent-memory run exits 0" rc_file_is h_busy 0
+  check "hand-over (pool wait): it publishes exactly one backup" exactly_one_published
+  check "hand-over (pool wait): the published copy matches its sha256" published_sha_matches
+  check "hand-over (pool wait): the lock is released for the pool wait" grep -q 'share-copy lock released for the pool wait' "$OUT"
+  check "hand-over (pool wait): the lock is taken back after it" test "$(grep -c 'share-copy lock taken' "$OUT")" -ge 2
+  OUT="$E/fake/h_busy_pg.out"
+  check "hand-over (pool wait): the pg-db copy exits 0" rc_file_is h_busy_pg 0
+  check "hand-over (pool wait): the pg-db copy never waited for the lock" bash -c "! grep -q 'waiting for the share-copy lock' '$OUT'"
+  check "hand-over (pool wait): the pg-db dump is verified on the share" pg_on_share "$PG_A"
+  check "hand-over (pool wait): the pg-db copy ended before the last agent-memory step started" pg_before_am_end "$FROM"
+  check "hand-over (pool wait): the two jobs never wrote at the same time" no_overlap
+
+  # 23b. The pool stays OK: the pg-db copy blocks on the lock during a step; at the step boundary this job sees the
+  #      waiting copy, hands the share over, and continues once that copy is done.
+  FROM=$(( $(wc -l < "$RL") + 1 ))
+  am_run h_step FAKE_DUMP_SEED=81 FAKE_DUMP_LINES=100000 BWLIMIT_KBPS=40 PACE_STEP_SECONDS=3
+  wait_line "$E/fake/h_step.out" 'share-copy lock taken'
+  pgdb_backup 20261126T095001Z; PG_B="$PG_ID"
+  pgdb_mirror h_step_pg
+  wait "$PG_BG" "$AM_BG"
+  OUT="$E/fake/h_step.out"
+  check "hand-over (step): the agent-memory run exits 0" rc_file_is h_step 0
+  check "hand-over (step): it publishes exactly one backup" exactly_one_published
+  check "hand-over (step): the published copy matches its sha256" published_sha_matches
+  check "hand-over (step): it hands the share to the waiting copy" grep -q 'a backup_pg_db.sh copy is waiting for the share; it goes first' "$OUT"
+  check "hand-over (step): it continues once that copy has finished" grep -q 'the waiting backup_pg_db.sh copy has finished' "$OUT"
+  OUT="$E/fake/h_step_pg.out"
+  check "hand-over (step): the pg-db copy exits 0" rc_file_is h_step_pg 0
+  check "hand-over (step): the pg-db copy waited for a step" grep -q 'waiting for the share-copy lock' "$OUT"
+  check "hand-over (step): the pg-db dump is verified on the share" pg_on_share "$PG_B"
+  check "hand-over (step): the pg-db copy ended before the last agent-memory step started" pg_before_am_end "$FROM"
+  check "hand-over (step): the two jobs never wrote at the same time" no_overlap
+  KEEP="$(pointer)"
+
+  # 23c. The waiting copy reads BUSY (its own state file here) until after this job's deadline: this job waits for
+  #      it, pauses with exit 4 without another write, and the next run resumes and publishes.
+  printf 'BUSY %s test\n' "$(date -u +%FT%TZ)" > "$E/fake/pool_busy"
+  # 20 s: the trim after a cut step runs `sync -f`, which took 5 s on a busy root disk once, and this job has to reach
+  # a step boundary before the deadline
+  DL=$(( $(date +%s) + 20 ))
+  FROM=$(( $(wc -l < "$RL") + 1 ))
+  am_run h_keep FAKE_DUMP_SEED=82 FAKE_DUMP_LINES=100000 BWLIMIT_KBPS=40 PACE_STEP_SECONDS=2 TRANSFER_DEADLINE_EPOCH="$DL"
+  wait_line "$E/fake/h_keep.out" 'share-copy lock taken'
+  pgdb_backup 20261127T095001Z; PG_C="$PG_ID"
+  pgdb_mirror h_keep_pg POOL_STATE_FILE="$E/fake/pool_busy" TRANSFER_DEADLINE_EPOCH=$(( DL + 4 ))
+  wait "$PG_BG" "$AM_BG"
+  K_ID="$(pending_id)"
+  OUT="$E/fake/h_keep.out"
+  check "kept share: the agent-memory run pauses (exit 4)" rc_file_is h_keep 4
+  check "kept share: the pause names the waiting copy" grep -q 'transfer paused: a waiting backup_pg_db.sh copy kept the share until the end of the copy window' "$OUT"
+  check "kept share: the paused marker is kept" paused_file
+  check "kept share: the previous pointer is unchanged" pointer_is "$KEEP"
+  check "kept share: exactly one published backup" exactly_one_published
+  OUT="$E/fake/h_keep_pg.out"
+  check "kept share: the pg-db copy is skipped (exit 1)" rc_file_is h_keep_pg 1
+  check "kept share: the pg-db copy wrote nothing" bash -c "! test -e '$MOUNTPOINT/backups/pg-db-postgres/labdb/$PG_C.dump'"
+  check "kept share: the two jobs never wrote at the same time" no_overlap
+  am_run h_keep_after FAKE_DUMP_SEED=83
+  wait "$AM_BG"
+  OUT="$E/fake/h_keep_after.out"
+  check "kept share: the next run exits 0" rc_file_is h_keep_after 0
+  check "kept share: it publishes the paused backup" pointer_is "$K_ID"
+  check "kept share: the published copy matches its sha256" published_sha_matches
+
+  # 23d. A pg-db copy that starts waiting during this job's last step gets the share only after the manifest and
+  #      restore list are on it too: they are copied under the lock (here that copy takes 2 s longer).
+  FROM=$(( $(wc -l < "$RL") + 1 ))
+  am_run h_last FAKE_DUMP_SEED=84 FAKE_DUMP_LINES=60000 BWLIMIT_KBPS=100 PACE_STEP_SECONDS=30 FAKE_RSYNC_META_SLEEP=2
+  wait_line "$E/fake/h_last.out" 'share-copy lock taken'
+  pgdb_backup 20261128T095001Z; PG_D="$PG_ID"
+  pgdb_mirror h_last_pg
+  wait "$PG_BG" "$AM_BG"
+  check "last step: the agent-memory run exits 0" rc_file_is h_last 0
+  check "last step: it publishes exactly one backup" exactly_one_published
+  check "last step: the pg-db copy exits 0" rc_file_is h_last_pg 0
+  check "last step: the pg-db dump is verified on the share" pg_on_share "$PG_D"
+  check "last step: the pg-db copy never wrote during the manifest copy" no_overlap "$FROM"
+  check "last step: the two jobs never wrote at the same time" no_overlap
+fi
 
 # 19. Runner: receipts for every run; an alert when the script dies without one.
 RUNNER_SRC="$(dirname "$SCRIPT")/backup_runner.py"
