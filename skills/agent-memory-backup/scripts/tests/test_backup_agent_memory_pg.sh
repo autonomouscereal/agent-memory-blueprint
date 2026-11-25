@@ -683,6 +683,18 @@ if [[ -f "$PGDB_SCRIPT" ]]; then
   # wait_line <file> <text> [seconds]: until a job's output has the line (the suites' short wait loop)
   wait_line() { local i; for i in $(seq 1 $(( ${3:-30} * 10 ))); do grep -qF -- "$2" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
   rc_file_is() { [[ "$(cat "$E/fake/$1.rc" 2>/dev/null)" == "$2" ]]; }
+  # log_epoch <file> <text> [nth]: the time of the nth line with <text> in a job's output (0 when absent)
+  log_epoch() {
+    date -u -d "$(grep -F -- "$2" "$1" | sed -n "${3:-1}p" | sed -n 's/^\[\([^]]*\)\].*/\1/p')" +%s 2>/dev/null || echo 0
+  }
+  # pg_took_in_pool_wait: the pg-db copy took the lock between this job's release for its pool wait and its next take
+  pg_took_in_pool_wait() {
+    local rel took back
+    rel="$(log_epoch "$E/fake/h_busy.out" 'share-copy lock released for the pool wait')"
+    back="$(log_epoch "$E/fake/h_busy.out" 'share-copy lock taken' 2)"
+    took="$(log_epoch "$E/fake/h_busy_pg.out" 'share-copy lock taken')"
+    (( rel > 0 && took >= rel && back > took ))
+  }
   # no_overlap [from line]: no rsync into the pg-db share dir ran while one into incoming/ ran (FAKE_RSYNC_LOG
   # intervals, from line <n> on)
   no_overlap() {
@@ -701,15 +713,16 @@ if [[ -f "$PGDB_SCRIPT" ]]; then
 
   # 23a. The pool reads BUSY after a step: this job releases the lock for its wait, the pg-db copy (started during
   #      the wait) takes it at once, waits out one BUSY read itself, copies when the pool reads OK, and this job
-  #      takes the lock back after its wait and publishes.
+  #      takes the lock back after its wait and publishes. (The trim after a cut step runs `sync -f`, which took 35 s
+  #      on a busy root disk once, hence the long waits for log lines.)
   FROM=$(( $(wc -l < "$RL") + 1 ))
   am_run h_busy FAKE_DUMP_SEED=80 FAKE_DUMP_LINES=60000 BWLIMIT_KBPS=40 PACE_STEP_SECONDS=2 PACE_BUSY_WAIT_SECONDS=6
-  wait_line "$E/fake/h_busy.out" 'share-copy lock taken'
+  wait_line "$E/fake/h_busy.out" 'share-copy lock taken' 120
   pool_state BUSY
-  wait_line "$E/fake/h_busy.out" 'pool not OK, no write: BUSY'
+  wait_line "$E/fake/h_busy.out" 'pool not OK, no write: BUSY' 120
   pgdb_backup 20261125T095001Z; PG_A="$PG_ID"
   pgdb_mirror h_busy_pg
-  wait_line "$E/fake/h_busy_pg.out" 'pool not OK, no NAS write: BUSY' 10
+  wait_line "$E/fake/h_busy_pg.out" 'pool not OK, no NAS write: BUSY' 120
   pool_state OK
   wait "$PG_BG" "$AM_BG"
   OUT="$E/fake/h_busy.out"
@@ -720,7 +733,7 @@ if [[ -f "$PGDB_SCRIPT" ]]; then
   check "hand-over (pool wait): the lock is taken back after it" test "$(grep -c 'share-copy lock taken' "$OUT")" -ge 2
   OUT="$E/fake/h_busy_pg.out"
   check "hand-over (pool wait): the pg-db copy exits 0" rc_file_is h_busy_pg 0
-  check "hand-over (pool wait): the pg-db copy never waited for the lock" bash -c "! grep -q 'waiting for the share-copy lock' '$OUT'"
+  check "hand-over (pool wait): the pg-db copy took the lock during the agent-memory pool wait" pg_took_in_pool_wait
   check "hand-over (pool wait): the pg-db dump is verified on the share" pg_on_share "$PG_A"
   check "hand-over (pool wait): the pg-db copy ended before the last agent-memory step started" pg_before_am_end "$FROM"
   check "hand-over (pool wait): the two jobs never wrote at the same time" no_overlap
@@ -729,7 +742,7 @@ if [[ -f "$PGDB_SCRIPT" ]]; then
   #      waiting copy, hands the share over, and continues once that copy is done.
   FROM=$(( $(wc -l < "$RL") + 1 ))
   am_run h_step FAKE_DUMP_SEED=81 FAKE_DUMP_LINES=100000 BWLIMIT_KBPS=40 PACE_STEP_SECONDS=3
-  wait_line "$E/fake/h_step.out" 'share-copy lock taken'
+  wait_line "$E/fake/h_step.out" 'share-copy lock taken' 120
   pgdb_backup 20261126T095001Z; PG_B="$PG_ID"
   pgdb_mirror h_step_pg
   wait "$PG_BG" "$AM_BG"
@@ -747,17 +760,16 @@ if [[ -f "$PGDB_SCRIPT" ]]; then
   check "hand-over (step): the two jobs never wrote at the same time" no_overlap
   KEEP="$(pointer)"
 
-  # 23c. The waiting copy reads BUSY (its own state file here) until after this job's deadline: this job waits for
-  #      it, pauses with exit 4 without another write, and the next run resumes and publishes.
+  # 23c. The pg-db copy holds the share and reads BUSY (its own state file here) until after this job's deadline:
+  #      this job finds it waiting at its first turn, waits for it, pauses with exit 4 without writing, and the next
+  #      run resumes and publishes. The pg-db copy starts first, so no step (and no trim) comes before the hand-over.
   printf 'BUSY %s test\n' "$(date -u +%FT%TZ)" > "$E/fake/pool_busy"
-  # 20 s: the trim after a cut step runs `sync -f`, which took 5 s on a busy root disk once, and this job has to reach
-  # a step boundary before the deadline
   DL=$(( $(date +%s) + 20 ))
   FROM=$(( $(wc -l < "$RL") + 1 ))
-  am_run h_keep FAKE_DUMP_SEED=82 FAKE_DUMP_LINES=100000 BWLIMIT_KBPS=40 PACE_STEP_SECONDS=2 TRANSFER_DEADLINE_EPOCH="$DL"
-  wait_line "$E/fake/h_keep.out" 'share-copy lock taken'
   pgdb_backup 20261127T095001Z; PG_C="$PG_ID"
   pgdb_mirror h_keep_pg POOL_STATE_FILE="$E/fake/pool_busy" TRANSFER_DEADLINE_EPOCH=$(( DL + 4 ))
+  wait_line "$E/fake/h_keep_pg.out" 'pool not OK, no NAS write: BUSY' 120
+  am_run h_keep FAKE_DUMP_SEED=82 FAKE_DUMP_LINES=100000 BWLIMIT_KBPS=40 PACE_STEP_SECONDS=2 TRANSFER_DEADLINE_EPOCH="$DL"
   wait "$PG_BG" "$AM_BG"
   K_ID="$(pending_id)"
   OUT="$E/fake/h_keep.out"
@@ -781,7 +793,7 @@ if [[ -f "$PGDB_SCRIPT" ]]; then
   #      restore list are on it too: they are copied under the lock (here that copy takes 2 s longer).
   FROM=$(( $(wc -l < "$RL") + 1 ))
   am_run h_last FAKE_DUMP_SEED=84 FAKE_DUMP_LINES=60000 BWLIMIT_KBPS=100 PACE_STEP_SECONDS=30 FAKE_RSYNC_META_SLEEP=2
-  wait_line "$E/fake/h_last.out" 'share-copy lock taken'
+  wait_line "$E/fake/h_last.out" 'share-copy lock taken' 120
   pgdb_backup 20261128T095001Z; PG_D="$PG_ID"
   pgdb_mirror h_last_pg
   wait "$PG_BG" "$AM_BG"
