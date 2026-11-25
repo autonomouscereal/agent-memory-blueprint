@@ -225,7 +225,8 @@ database, with raw `pg_dump` / `pg_restore` / `psql` inside the container and no
   only then deletes the previous backup. A failed or partial copy is deleted; the previous backup is never touched
   before the new one verifies.
 - **Gentle on the NAS.** The copy runs in paced `rsync --append` steps inside a UTC window, waits while a pool-state
-  probe on the NAS says BUSY, stops before a free-space floor, and resumes a paused copy the next night.
+  probe on the NAS says BUSY, stops before a free-space floor, and resumes a paused copy the next night. The nightly
+  starts early enough that its dump is done when the window opens, and waits for it.
 - **Proven restorable.** A weekly test restores the published dump into a throwaway container and compares exact row
   counts with the live database.
 - **Siblings.** `backup_pg_db.sh` covers the smaller databases in the same container (snapshot dump, exact restore

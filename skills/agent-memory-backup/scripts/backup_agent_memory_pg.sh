@@ -34,9 +34,17 @@
 # in flock, so the kernel wakes each one when the other releases. On 11-25 a backup_pg_db.sh copy waited from 09:51
 # to 13:00Z for the lock while this job held it through nine 15-minute BUSY waits, and it never ran. The manifest and
 # restore list are now copied under the lock as well; 3.2.2 wrote them after releasing it.
+#
+# 3.3.0 (2026-11-25): the nightly may start early enough that its dump and stage verify are done before the copy
+# window opens, so the copy gets the whole window. A run that reaches the copy before the window opens (a fresh dump
+# or only the resume of a paused copy) waits once, until the window opens; it pauses with exit 4 only after the
+# window's end, as before. `install-cron --after-next-run` leaves the new cron block for backup_runner.py to install
+# when the next run ends, so a schedule change never moves the run that is already due. With the 02:20 local start
+# a 37 GB fresh dump reached the copy at about 10:25Z and needed two nights; started at 22:10 local (05:10Z) it is
+# ready by about 06:15Z and the window holds about 52 GB at the 11-25 pace.
 set -Eeuo pipefail
 
-SCRIPT_VERSION="3.2.3"
+SCRIPT_VERSION="3.3.0"
 
 # load_env_file <file>: set each KEY=VALUE of <file> that is not already set, so a variable from the environment (a
 # cron line, a test, an operator's override) wins over the file. Blank lines and # comments are skipped, an
@@ -85,6 +93,8 @@ POOL_STATE_FILE="${POOL_STATE_FILE:-$MOUNTPOINT/.nas-tuning/pool_state}"
 POOL_STATE_MAX_AGE_SECONDS="${POOL_STATE_MAX_AGE_SECONDS:-300}"
 TRANSFER_WINDOW_UTC="${TRANSFER_WINDOW_UTC:-07:00-13:00}"
 TRANSFER_DEADLINE_EPOCH="${TRANSFER_DEADLINE_EPOCH:-}"
+# 3.3.0: with TRANSFER_DEADLINE_EPOCH, the first second a step may write (the window form uses the window's start).
+TRANSFER_START_EPOCH="${TRANSFER_START_EPOCH:-}"
 RESUME_TRIM_BYTES="${RESUME_TRIM_BYTES:-67108864}"
 STEP_KILL_GRACE_SECONDS="${STEP_KILL_GRACE_SECONDS:-60}"
 # 3.2.0 (11-24, after the host's root disk filled up): no staging and no copy step while / (the live Postgres) or
@@ -126,6 +136,8 @@ ALERT_FILE="$STATE_DIR/alert.json"
 ALERT_LOG="$STATE_DIR/alerts.log"
 # 3.2.0: names the incoming copy a paused run left for the next run to resume.
 PAUSED_FILE="$STATE_DIR/paused-transfer.txt"
+# 3.3.0: a cron schedule backup_runner.py installs when the next run ends (install-cron --after-next-run).
+CRON_AFTER_RUN_FILE="$STATE_DIR/install-cron-after-run.txt"
 
 # Exit codes: 0 published and exactly one backup kept; 1 failed, previous backup
 # kept; 3 published and verified, but some superseded or stale paths could not
@@ -162,6 +174,7 @@ Commands:
   status          Show media mount, latest pointer, published backups, alert, schedule
   list            List published dump files on media storage
   install-cron    Install or refresh the daily user crontab entry (saves the old crontab first)
+                  --after-next-run: leave it for backup_runner.py to install when the next run ends
   uninstall-cron  Remove this script's managed crontab block
   restore-help    Print restore command templates without running them
 
@@ -182,6 +195,7 @@ script (AGENT_MEMORY_BACKUP_ENV names another file). The environment wins over t
   POOL_STATE_MAX_AGE_SECONDS A state line older than this counts as BUSY. Default: 300
   TRANSFER_WINDOW_UTC    Copy steps run only inside HH:MM-HH:MM UTC. Default: 07:00-13:00
   TRANSFER_DEADLINE_EPOCH If set, replaces the window: steps run only before this epoch second
+  TRANSFER_START_EPOCH   With TRANSFER_DEADLINE_EPOCH: steps run only from this epoch second (a run waits for it)
   RESUME_TRIM_BYTES      Bytes cut off a partial before it is resumed. Default: 67108864
   MIN_SYSTEM_FREE_KB     No staging or copy step while a FREE_CHECK_PATHS entry has less free. Default: 19531250 (20 GB)
   FREE_CHECK_PATHS       Paths checked for MIN_SYSTEM_FREE_KB. Default: / and LOCAL_STAGING
@@ -189,7 +203,7 @@ script (AGENT_MEMORY_BACKUP_ENV names another file). The environment wins over t
   SHARE_WAIT_LOCK        Held shared by a waiting backup_pg_db.sh copy. Default: SHARE_COPY_LOCK with -wait.lock
   LOCAL_STAGING          Where the dump is staged. Default: $HOME/agent-memory-backup/staging
   DEST_ROOT              Where the verified backup is published. Default: $MOUNTPOINT/backups/agent-memory-postgres
-  CRON_SCHEDULE          Cron schedule. Default: 20 2 * * *
+  CRON_SCHEDULE          Cron schedule, server local time; end the dump before the window opens. Default: 20 2 * * *
   CACHE_WRAP             Command install-cron puts in front of the runner, if executable. Default: empty
   MIN_DEST_FREE_KB       Destination free space to keep beyond the new dump. Default: 1048576
   LOCAL_MIN_FREE_KB      Local staging free space to keep beyond the new dump. Default: 62914560 (60 GiB)
@@ -427,6 +441,7 @@ validate_pacing_config() {
   [[ "$MIN_SYSTEM_FREE_KB" =~ ^[0-9]+$ ]] || die "MIN_SYSTEM_FREE_KB must be a non-negative integer"
   if [[ -n "$TRANSFER_DEADLINE_EPOCH" ]]; then
     [[ "$TRANSFER_DEADLINE_EPOCH" =~ ^[0-9]+$ ]] || die "TRANSFER_DEADLINE_EPOCH must be an epoch second"
+    [[ -z "$TRANSFER_START_EPOCH" || "$TRANSFER_START_EPOCH" =~ ^[0-9]+$ ]] || die "TRANSFER_START_EPOCH must be an epoch second"
   else
     [[ "$TRANSFER_WINDOW_UTC" =~ $WINDOW_RE ]] || die "TRANSFER_WINDOW_UTC must be HH:MM-HH:MM (UTC): $TRANSFER_WINDOW_UTC"
     [[ "${BASH_REMATCH[1]}${BASH_REMATCH[2]}" < "${BASH_REMATCH[3]}${BASH_REMATCH[4]}" ]] ||
@@ -440,8 +455,29 @@ transfer_window_end() {
   local now today start end
   now="$(date +%s)"
   if [[ -n "$TRANSFER_DEADLINE_EPOCH" ]]; then
-    if [[ "$TRANSFER_DEADLINE_EPOCH" =~ ^[0-9]+$ ]] && (( now < TRANSFER_DEADLINE_EPOCH )); then
-      echo "$TRANSFER_DEADLINE_EPOCH"
+    local open=1
+    [[ "$TRANSFER_DEADLINE_EPOCH" =~ ^[0-9]+$ ]] && (( now < TRANSFER_DEADLINE_EPOCH )) || open=0
+    # 3.3.0: not yet open before TRANSFER_START_EPOCH
+    [[ "$TRANSFER_START_EPOCH" =~ ^[0-9]+$ ]] && (( now < TRANSFER_START_EPOCH )) && open=0
+    if (( open == 1 )); then echo "$TRANSFER_DEADLINE_EPOCH"; else echo 0; fi
+    return 0
+  fi
+  if [[ ! "$TRANSFER_WINDOW_UTC" =~ $WINDOW_RE ]]; then echo 0; return 0; fi
+  today="$(date -u +%F)"
+  start="$(date -u -d "$today ${BASH_REMATCH[1]}:${BASH_REMATCH[2]}" +%s)"
+  end="$(date -u -d "$today ${BASH_REMATCH[3]}:${BASH_REMATCH[4]}" +%s)"
+  if (( start < end && now >= start && now < end )); then echo "$end"; else echo 0; fi
+}
+
+# 3.3.0: when the copy window opens later (today's TRANSFER_WINDOW_UTC start, or TRANSFER_START_EPOCH before
+# TRANSFER_DEADLINE_EPOCH), that epoch second; 0 when it is open now or has already ended.
+transfer_window_opens() {
+  local now today start end
+  now="$(date +%s)"
+  if [[ -n "$TRANSFER_DEADLINE_EPOCH" ]]; then
+    if [[ "$TRANSFER_START_EPOCH" =~ ^[0-9]+$ && "$TRANSFER_DEADLINE_EPOCH" =~ ^[0-9]+$ ]] &&
+       (( now < TRANSFER_START_EPOCH && TRANSFER_START_EPOCH < TRANSFER_DEADLINE_EPOCH )); then
+      echo "$TRANSFER_START_EPOCH"
     else
       echo 0
     fi
@@ -451,7 +487,7 @@ transfer_window_end() {
   today="$(date -u +%F)"
   start="$(date -u -d "$today ${BASH_REMATCH[1]}:${BASH_REMATCH[2]}" +%s)"
   end="$(date -u -d "$today ${BASH_REMATCH[3]}:${BASH_REMATCH[4]}" +%s)"
-  if (( start < end && now >= start && now < end )); then echo "$end"; else echo 0; fi
+  if (( start < end && now < start )); then echo "$start"; else echo 0; fi
 }
 
 # 3.2.0: cut <bytes> off the end of a partial copy before it is resumed (a step that was stopped, a transient
@@ -572,9 +608,19 @@ paced_copy_inner() {
   dest="$dest_dir/$(basename "$src")"
   src_size="$(stat -c '%s' "$src")"
   errfile="$(mktemp)"
+  local opens
   while true; do
     end="$(transfer_window_end)"
     if (( end == 0 )); then
+      # 3.3.0: reached before the window opens (the nightly starts early so that its dump is done by then, or the run
+      # only resumes a paused copy): one wait until the window opens, then the normal steps. Never a pause for that.
+      opens="$(transfer_window_opens)"
+      if (( opens > 0 )); then
+        now="$(date +%s)"
+        log "the copy window opens at $(date -u -d "@$opens" '+%FT%H:%MZ'); waiting $(( opens - now ))s for it (no write before then)"
+        (( opens > now )) && sleep $(( opens - now ))
+        continue
+      fi
       if [[ -n "$TRANSFER_DEADLINE_EPOCH" ]]; then
         PAUSE_REASON="the copy deadline $(date -u -d "@$TRANSFER_DEADLINE_EPOCH" '+%FT%TZ') has passed"
       else
@@ -1236,10 +1282,18 @@ dry_run_report() {
     log "DRY-RUN would create a fresh dump ($new_id) in $LOCAL_STAGING"
   fi
   log "DRY-RUN would copy it to $DEST_ROOT/incoming/$new_id/, verify size + sha256 vs manifest and a complete pg_restore --list, then publish"
-  local wend
+  local wend wopens wstate
   pool_state_ok || true
   wend="$(transfer_window_end)"
-  log "DRY-RUN copy plan: --bwlimit=$BWLIMIT_KBPS KiB/s, steps of ${PACE_STEP_SECONDS}s, window ${TRANSFER_DEADLINE_EPOCH:+deadline }${TRANSFER_DEADLINE_EPOCH:-$TRANSFER_WINDOW_UTC UTC} ($([[ "$wend" != 0 ]] && echo "open until $(date -u -d "@$wend" '+%H:%MZ')" || echo 'closed now: a run would pause without writing')), pool state now: $POOL_STATE_LINE"
+  wopens="$(transfer_window_opens)"
+  if [[ "$wend" != 0 ]]; then
+    wstate="open until $(date -u -d "@$wend" '+%H:%MZ')"
+  elif [[ "$wopens" != 0 ]]; then
+    wstate="opens at $(date -u -d "@$wopens" '+%H:%MZ'): a run would wait for it, then copy"
+  else
+    wstate="closed now: a run would pause without writing"
+  fi
+  log "DRY-RUN copy plan: --bwlimit=$BWLIMIT_KBPS KiB/s, steps of ${PACE_STEP_SECONDS}s, window ${TRANSFER_DEADLINE_EPOCH:+deadline }${TRANSFER_DEADLINE_EPOCH:-$TRANSFER_WINDOW_UTC UTC} ($wstate), pool state now: $POOL_STATE_LINE"
   log "DRY-RUN share: $SHARE_COPY_LOCK is held only while a step writes and is released for each pool wait; a backup_pg_db.sh copy waiting on $SHARE_WAIT_LOCK goes first at the next step"
   if [[ -n "$latest" ]]; then
     if [[ "$DRY_RUN_HASH" == "1" ]]; then
@@ -1305,6 +1359,7 @@ show_status() {
   log "pool state: $POOL_STATE_LINE"
   log "free space: $(free_space_summary)"
   [[ -s "$PAUSED_FILE" ]] && log "paused copy: $(head -n 2 "$PAUSED_FILE" | tr '\n' ' ')"
+  [[ -s "$CRON_AFTER_RUN_FILE" ]] && log "cron schedule to install when the next run ends: $(head -n 1 "$CRON_AFTER_RUN_FILE")"
   log "event_count: $(psql_scalar 'select count(*) from public.agent_memory_events;')"
   log "latest_event_id: $(psql_scalar 'select coalesce(max(id), 0) from public.agent_memory_events;')"
 
@@ -1345,6 +1400,7 @@ list_backups() {
 }
 
 install_cron() {
+  local when="${1:-}"
   init_dirs
   require_cmd crontab
   require_cmd readlink
@@ -1353,6 +1409,21 @@ install_cron() {
   local runner
   runner="$(dirname "$SCRIPT_PATH")/backup_runner.py"
   [[ -f "$runner" ]] || die "runner not found beside the script: $runner"
+  [[ "$CRON_SCHEDULE" =~ ^[0-9*/,-]+(\ [0-9*/,-]+){4}$ ]] ||
+    die "CRON_SCHEDULE must be five cron fields of digits, * / , and -: $CRON_SCHEDULE"
+  case "$when" in
+    "") ;;
+    --after-next-run)
+      # 3.3.0: a new schedule must not move the run that is already due (it may be resuming a paused copy).
+      # backup_runner.py installs this schedule when the next run ends, then deletes the file.
+      printf '%s\n' "$CRON_SCHEDULE" > "$CRON_AFTER_RUN_FILE.tmp"
+      mv "$CRON_AFTER_RUN_FILE.tmp" "$CRON_AFTER_RUN_FILE"
+      log "cron schedule '$CRON_SCHEDULE' is left for backup_runner.py to install when the next run ends ($CRON_AFTER_RUN_FILE); the crontab is unchanged"
+      return 0 ;;
+    *) die "install-cron: unknown option: $when (use --after-next-run or nothing)" ;;
+  esac
+  local pending=""
+  [[ -e "$CRON_AFTER_RUN_FILE" ]] && pending="$(head -n 1 "$CRON_AFTER_RUN_FILE")"
 
   local wrap=""
   [[ -n "$CACHE_WRAP" && -x "${CACHE_WRAP%% *}" ]] && wrap="$CACHE_WRAP "
@@ -1371,6 +1442,11 @@ install_cron() {
   crontab "$cron_tmp"
   rm -f "$cron_tmp"
   log "installed cron schedule: $CRON_SCHEDULE via $runner (previous crontab saved to $backup)"
+  if [[ -e "$CRON_AFTER_RUN_FILE" ]]; then
+    # 3.3.0: done; an install with another schedule supersedes the one that was left for after a run.
+    [[ "$pending" == "$CRON_SCHEDULE" ]] || log "this replaces the schedule that was left for after the next run: $pending"
+    rm -f -- "$CRON_AFTER_RUN_FILE"
+  fi
 }
 
 uninstall_cron() {
@@ -1415,7 +1491,7 @@ main() {
     verify) verify_published "${2:-}" ;;
     status) show_status ;;
     list) list_backups ;;
-    install-cron) install_cron ;;
+    install-cron) install_cron "${2:-}" ;;
     uninstall-cron) uninstall_cron ;;
     restore-help) restore_help ;;
     -h|--help|help) usage ;;

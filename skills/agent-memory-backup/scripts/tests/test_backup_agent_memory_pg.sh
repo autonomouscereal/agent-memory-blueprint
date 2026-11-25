@@ -464,8 +464,9 @@ check "corrupt partial: the next run publishes that backup" pointer_is "$C_ID"
 check "corrupt partial: the republished copy matches its sha256" published_sha_matches
 KEEP="$(pointer)"
 
-# 20f. Outside the copy window a run (a fresh dump here) writes nothing and pauses at once.
-W="00:00-00:01"; [[ "$(date -u +%H:%M)" == "00:00" ]] && W="12:00-12:01"
+# 20f. After the copy window's end a run (a fresh dump here) writes nothing and pauses at once. (3.3.0: before the
+#      window opens it would wait for it, so the window here must already have ended today.)
+W="00:00-00:01"; [[ "$(date -u +%H:%M)" == "00:00" ]] && sleep 61
 run_job p_window run FAKE_DUMP_SEED=48 TRANSFER_DEADLINE_EPOCH= TRANSFER_WINDOW_UTC="$W"; OUT="$E/fake/p_window.out"
 W_ID="$(pending_id)"
 check "window: outside the window exits 4" rc_is 4
@@ -566,9 +567,11 @@ check "share lock: the copy starts only after the other job released it" test "$
 check "share lock: then the run publishes (exit 0)" rc_is 0
 check "share lock: the new backup is published" test "$(pointer)" != "$KEEP"
 KEEP="$(pointer)"
-( flock 8; sleep 8 ) 8>>"$E/share-copy.lock" &
+# The deadline leaves 10 s to reach the copy (4 s were once too few on a loaded host); the holder keeps the lock
+# past it.
+( flock 8; sleep 16 ) 8>>"$E/share-copy.lock" &
 sleep 0.5
-run_job l_pause run FAKE_DUMP_SEED=62 TRANSFER_DEADLINE_EPOCH=$(( $(date +%s) + 4 )); OUT="$E/fake/l_pause.out"
+run_job l_pause run FAKE_DUMP_SEED=62 TRANSFER_DEADLINE_EPOCH=$(( $(date +%s) + 10 )); OUT="$E/fake/l_pause.out"
 L_ID="$(basename "$(cat "$STATE_DIR/pending-stage.txt" 2>/dev/null)" | cut -d. -f1)"
 wait
 check "share lock: held until the deadline pauses the run (exit 4)" rc_is 4
@@ -635,6 +638,22 @@ check "env file beside the script: other cron lines are kept" grep -qx "1 1 \* \
 OUT="$E/fake/f_cron_env.out"
 env -u AGENT_MEMORY_BACKUP_ENV CACHE_WRAP= bash "$CP/backup_agent_memory_pg.sh" install-cron > "$OUT" 2>&1; RC=$?
 check "env file beside the script: CACHE_WRAP= in the environment installs the plain line" grep -qxF "20 2 * * * BWLIMIT_KBPS=100000 /usr/bin/python3 $CP/backup_runner.py >> $LOG_DIR/cron.log 2>&1" "$E/fake/crontab"
+# 3.3.0: install-cron --after-next-run leaves the schedule for the runner and changes nothing now; a later plain
+# install-cron installs it and removes the file; a schedule that is not five cron fields is refused.
+cp "$E/fake/crontab" "$E/fake/crontab.before-deferred"
+OUT="$E/fake/f_cron_after.out"
+env -u AGENT_MEMORY_BACKUP_ENV CACHE_WRAP= CRON_SCHEDULE="10 22 * * *" bash "$CP/backup_agent_memory_pg.sh" install-cron --after-next-run > "$OUT" 2>&1; RC=$?
+check "deferred cron: install-cron --after-next-run exits 0" rc_is 0
+check "deferred cron: the crontab is unchanged" cmp -s "$E/fake/crontab" "$E/fake/crontab.before-deferred"
+check "deferred cron: the schedule is left for the runner" grep -qx "10 22 \* \* \*" "$STATE_DIR/install-cron-after-run.txt"
+OUT="$E/fake/f_cron_bad.out"
+env -u AGENT_MEMORY_BACKUP_ENV CACHE_WRAP= CRON_SCHEDULE='10 22 * * * ; touch /tmp/x' bash "$CP/backup_agent_memory_pg.sh" install-cron > "$OUT" 2>&1; RC=$?
+check "cron: a schedule that is not five cron fields is refused (exit 1)" rc_is 1
+check "cron: the refused schedule changed nothing" cmp -s "$E/fake/crontab" "$E/fake/crontab.before-deferred"
+OUT="$E/fake/f_cron_now.out"
+env -u AGENT_MEMORY_BACKUP_ENV CACHE_WRAP= CRON_SCHEDULE="10 22 * * *" bash "$CP/backup_agent_memory_pg.sh" install-cron > "$OUT" 2>&1; RC=$?
+check "deferred cron: a plain install-cron installs the schedule" grep -qxF "10 22 * * * BWLIMIT_KBPS=100000 /usr/bin/python3 $CP/backup_runner.py >> $LOG_DIR/cron.log 2>&1" "$E/fake/crontab"
+check "deferred cron: and removes the file it left" test ! -e "$STATE_DIR/install-cron-after-run.txt"
 # Without any env file the defaults are generic.
 OUT="$E/fake/f_defaults.out"
 env -u MOUNTPOINT -u DEST_ROOT AGENT_MEMORY_BACKUP_ENV="$E/fake/missing.env" bash "$SCRIPT" restore-help > "$OUT" 2>&1; RC=$?
@@ -805,12 +824,73 @@ if [[ -f "$PGDB_SCRIPT" ]]; then
   check "last step: the two jobs never wrote at the same time" no_overlap
 fi
 
+# 24. 3.3.0: a run that reaches the copy before the window opens waits once for it, then copies; it never pauses
+#     for being early, whether it took a fresh dump (24a) or only resumes a paused copy (24b). The window form's
+#     opening time shows in the dry-run plan (24c).
+new_env 24
+# steps_from <rsync log> <epoch>: copy steps of the dump ran, and none started before <epoch>
+steps_from() { awk -v t="$2" '$1 == "start" && $4 ~ /\.dump$/ { n++; if ($2 < t) bad = 1 } END { exit !(n > 0 && !bad) }' "$1"; }
+# line_at_or_after <text> <epoch>: the first line with <text> in OUT is logged at or after <epoch>
+line_at_or_after() {
+  local at; at="$(date -u -d "$(grep -F -m1 -- "$1" "$OUT" | sed -n 's/^\[\([^]]*\)\].*/\1/p')" +%s 2>/dev/null || echo 0)"
+  (( at >= $2 ))
+}
+run_job e_base run FAKE_DUMP_SEED=90; OUT="$E/fake/e_base.out"
+check "early: baseline run exits 0" rc_is 0
+KEEP="$(pointer)"
+
+# 24a. A fresh dump done before the window opens: one wait, then the copy; published, no pause, no alert.
+OPEN=$(( $(date +%s) + 10 ))
+run_job e_fresh run FAKE_DUMP_SEED=91 TRANSFER_START_EPOCH="$OPEN" FAKE_RSYNC_LOG="$E/fake/rsync_e1.log"; OUT="$E/fake/e_fresh.out"
+check "early: a fresh dump that reaches the copy early exits 0" rc_is 0
+check "early: it logs when the window opens and waits for it" grep -q 'the copy window opens at .*; waiting [0-9]*s for it' "$OUT"
+check "early: it waits once" test "$(grep -c 'the copy window opens at' "$OUT")" = 1
+check "early: no copy step starts before the window opens" steps_from "$E/fake/rsync_e1.log" "$OPEN"
+check "early: it publishes the new backup" bash -c "[[ '$(pointer)' != '$KEEP' ]]"
+check "early: exactly one published backup" exactly_one_published
+check "early: no paused marker" no_paused_file
+check "early: no alert" no_alert
+
+# 24b. A run that only resumes a paused copy (no dump) also waits for the window instead of exiting 4, and its
+#      first write (the trim) comes after the window opens.
+run_job e_cut run FAKE_DUMP_SEED=92 FAKE_DUMP_LINES=100000 BWLIMIT_KBPS=40 PACE_STEP_SECONDS=2 TRANSFER_DEADLINE_EPOCH=$(( $(date +%s) + 12 )); OUT="$E/fake/e_cut.out"
+check "early resume: the setup run paused (exit 4)" rc_is 4
+E_ID="$(pending_id)"; E_PART="$(inc_size "$E_ID")"
+OPEN=$(( $(date +%s) + 10 ))
+run_job e_resume run FAKE_DUMP_SEED=93 TRANSFER_START_EPOCH="$OPEN" FAKE_RSYNC_LOG="$E/fake/rsync_e2.log"; OUT="$E/fake/e_resume.out"
+check "early resume: exits 0, not 4" rc_is 0
+check "early resume: it resumes the paused copy" grep -qF "resuming the paused copy in $DEST_ROOT/incoming/$E_ID" "$OUT"
+check "early resume: no new dump" no_new_dump
+check "early resume: it waits for the window" grep -q 'the copy window opens at' "$OUT"
+check "early resume: no copy step starts before the window opens" steps_from "$E/fake/rsync_e2.log" "$OPEN"
+if (( E_PART > 0 )); then
+  check "early resume: the trim of the partial comes after the window opens" line_at_or_after 'trimmed the partial copy from' "$OPEN"
+else  # a loaded host can reach the setup's deadline before any step: no partial, so nothing to trim
+  check "early resume: (the setup copied nothing, so there is no trim to time)" true
+fi
+check "early resume: it publishes the paused backup" pointer_is "$E_ID"
+check "early resume: exactly one published backup" exactly_one_published
+check "early resume: no paused marker" no_paused_file
+check "early resume: no alert" no_alert
+
+# 24c. The window form: before today's window opens, the dry-run plan says the run would wait for it.
+if [[ "$(date -u +%H%M)" < "2350" ]]; then
+  run_job e_dry dry-run TRANSFER_DEADLINE_EPOCH= TRANSFER_WINDOW_UTC="23:58-23:59"; OUT="$E/fake/e_dry.out"
+  check "window form: the dry-run exits 0" rc_is 0
+  check "window form: the plan says when the window opens" grep -qF 'window 23:58-23:59 UTC (opens at 23:58Z: a run would wait for it, then copy)' "$OUT"
+else
+  check "window form: (not checked after 23:50 UTC)" true
+  check "window form: (not checked after 23:50 UTC)" true
+fi
+
 # 19. Runner: receipts for every run; an alert when the script dies without one.
 RUNNER_SRC="$(dirname "$SCRIPT")/backup_runner.py"
 if [[ -f "$RUNNER_SRC" ]]; then
   RD="$WORK/runner"; mkdir -p "$RD/bin" "$RD/state" "$RD/logs"
   cp "$RUNNER_SRC" "$RD/bin/backup_runner.py"
+  # The stub script: a run exits FAKE_EXIT; install-cron (3.3.0) records its schedule and exits FAKE_INSTALL_EXIT.
   printf '#!/usr/bin/env bash
+if [[ "${1:-}" == install-cron ]]; then echo "install-cron ${CRON_SCHEDULE:-}" >> "${FAKE_INSTALL_LOG:-/dev/null}"; exit "${FAKE_INSTALL_EXIT:-0}"; fi
 exit "${FAKE_EXIT:-0}"
 ' > "$RD/bin/backup_agent_memory_pg.sh"; chmod +x "$RD/bin/backup_agent_memory_pg.sh"
   runner() { env AGENT_MEMORY_BACKUP_ENV="$WORK/empty.env" AGENT_MEMORY_BACKUP_HOME="$RD" STATE_DIR="$RD/state" LOG_DIR="$RD/logs" ALERT_SYSLOG=0 "$@" python3 "$RD/bin/backup_runner.py"; RC=$?; sleep 1.1; }
@@ -838,6 +918,26 @@ exit "${FAKE_EXIT:-0}"
   env -u AGENT_MEMORY_BACKUP_ENV AGENT_MEMORY_BACKUP_HOME="$RD" STATE_DIR="$RD/state" LOG_DIR="$RD/logs" ALERT_SYSLOG=0 FAKE_EXIT=0 python3 "$RD/bin/backup_runner.py"; RC=$?; sleep 1.1
   check "runner env file: the environment's STATE_DIR wins" test "$(ls "$RD/state-from-file"/normal-run-*.public.json | wc -l)" = "$BEFORE_N"
   rm -f "$RD/bin/agent-memory-backup.env"
+  # 3.3.0: a 10 h watchdog by default, and a schedule left by `install-cron --after-next-run` is installed after a
+  # run that held the lock (not after a lock skip); a failed install keeps the file for the next run.
+  check "runner: the default watchdog is 10 h" grep -q '"timeout_seconds": 36000' "$RD/state/reliability-run-exit.public.json"
+  IL="$RD/install.log"; PENDING="$RD/state/install-cron-after-run.txt"
+  printf '10 22 * * *\n' > "$PENDING"
+  runner FAKE_EXIT=75 FAKE_INSTALL_LOG="$IL"
+  check "runner: after a lock skip the schedule is not installed" test ! -s "$IL"
+  check "runner: after a lock skip the file is kept" test -s "$PENDING"
+  runner FAKE_EXIT=0 FAKE_INSTALL_LOG="$IL" FAKE_INSTALL_EXIT=1
+  check "runner: a failed install-cron keeps the file for the next run" test -s "$PENDING"
+  check "runner: the receipt says it failed" grep -q '"cron_after_run": "install-cron exited 1' "$RD/state/reliability-run-exit.public.json"
+  : > "$IL"
+  runner FAKE_EXIT=4 FAKE_INSTALL_LOG="$IL"
+  check "runner: after a run it installs the schedule that was left" grep -qx "install-cron 10 22 \* \* \*" "$IL"
+  check "runner: the exit code of the run still passes through" rc_is 4
+  check "runner: the file is removed after the install" test ! -e "$PENDING"
+  check "runner: the receipt names the installed schedule" grep -q '"cron_after_run": "installed cron schedule 10 22 \* \* \*"' "$RD/state/reliability-run-exit.public.json"
+  : > "$IL"
+  runner FAKE_EXIT=0 FAKE_INSTALL_LOG="$IL"
+  check "runner: with no file left it installs nothing" test ! -s "$IL"
 fi
 
 echo "# passed $PASS failed $FAIL"

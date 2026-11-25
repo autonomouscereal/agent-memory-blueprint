@@ -12,7 +12,7 @@ and none is stored. No ORM, SQLAlchemy, Pydantic, SQLite or Chroma.
 | File (in `scripts/`) | What it does |
 |---|---|
 | `backup_agent_memory_pg.sh` | Dump `agent_memory`, copy it to the share in paced steps, verify, publish, then delete every other backup |
-| `backup_runner.py` | Cron entrypoint: runs the script under a 6 h watchdog and writes an exit receipt |
+| `backup_runner.py` | Cron entrypoint: runs the script under a 10 h watchdog, writes an exit receipt, installs a schedule left for after the run |
 | `restore_test_agent_memory.sh` | Weekly full restore of the published dump into a throwaway container, exact row counts against live |
 | `backup_pg_db.sh` | The smaller databases in the same container: snapshot dump, restore test, local + NAS copies, daily/weekly rotation |
 | `run_remote_backup.py` | Runs the deployed script on the database host over SSH from a workstation |
@@ -63,6 +63,8 @@ DB, and `status` reported a stale dump on the share with "alert: none". With the
 | `PACE_GATE` | `1` | `0` copies without reading the pool state |
 | `TRANSFER_WINDOW_UTC` | `07:00-13:00` | Copy steps only inside this UTC window (must not cross midnight) |
 | `TRANSFER_DEADLINE_EPOCH` | empty | Replaces the window: steps only before this epoch second |
+| `TRANSFER_START_EPOCH` | empty | With the deadline: steps only from this epoch second (the run waits for it) |
+| `CRON_SCHEDULE` / `BACKUP_TIMEOUT_SECONDS` | `20 2 * * *` / `36000` | The nightly's start (server local time) and the runner's watchdog (see "Scheduling") |
 | `MIN_SYSTEM_FREE_KB` / `FREE_CHECK_PATHS` | 20 GB / `/` and `LOCAL_STAGING` | No staging and no copy step below this free space |
 | `LOCAL_MIN_FREE_KB` / `MIN_DEST_FREE_KB` | 60 GiB / 1 GiB | Free space kept beyond the expected dump on the stage and the share |
 | `STATE_DIR`, `LOG_DIR`, `LOCK_FILE` | under `$HOME/agent-memory-backup/` | State, logs, the run lock `backup-v2.lock` |
@@ -82,6 +84,7 @@ DRY_RUN_HASH=0 bin/backup_agent_memory_pg.sh dry-run   # the same without hashin
 bin/backup_agent_memory_pg.sh verify [id]   # size + SHA-256 against the manifest, complete pg_restore --list
 bin/backup_agent_memory_pg.sh run           # an immediate restore point; replaces the published one once it verifies
 bin/backup_agent_memory_pg.sh install-cron  # saves the old crontab first
+bin/backup_agent_memory_pg.sh install-cron --after-next-run   # the runner installs it when the next run ends
 bin/backup_agent_memory_pg.sh restore-help
 ```
 
@@ -168,7 +171,9 @@ changed; dump, verify, publish and delete-after-publish are as before.
   together with `--whole-file`).
 - Before each step the job reads `POOL_STATE_FILE`. BUSY, missing, unreadable or older than
   `POOL_STATE_MAX_AGE_SECONDS` (300) means no write; it reads again after `PACE_BUSY_WAIT_SECONDS`.
-- No step writes outside `TRANSFER_WINDOW_UTC`. A copy not finished by the window's end stops with exit 4: the
+- No step writes outside `TRANSFER_WINDOW_UTC`. Since 3.3.0 a run that reaches the copy before the window opens (a
+  fresh dump done early, or a run that only resumes a paused copy) waits once, until the window opens, and then
+  copies; it never pauses for being early. A copy not finished by the window's end stops with exit 4: the
   partial in `incoming/<id>/`, the verified stage and `state/paused-transfer.txt` are kept and a warning alert is
   raised. The next run resumes that same backup (no new dump) after cutting `RESUME_TRIM_BYTES` (64 MiB) off the
   partial; the final SHA-256 and `pg_restore --list` still decide, and a bad partial is deleted and copied again.
@@ -238,11 +243,27 @@ cache on the NAS must stay writable for every user the share maps clients to.
 # END agent-memory-backup
 ```
 
-The schedule is `CRON_SCHEDULE` (default `20 2 * * *`, server local time). `CACHE_WRAP` is optional: a host that
-keeps backups out of the page cache can run the job inside a `MemoryHigh` scope and reclaim the Postgres
-container's cache from `pg_dump` afterwards; `CACHE_WRAP=` installs the plain line. The runner wraps
-`backup_agent_memory_pg.sh run` in a 6-hour watchdog (`BACKUP_TIMEOUT_SECONDS=21600`); on TERM the script deletes
-its unpublished transfer and raises an alert.
+The schedule is `CRON_SCHEDULE` (default `20 2 * * *`, server local time); keep it in the env file. `CACHE_WRAP` is
+optional: a host that keeps backups out of the page cache can run the job inside a `MemoryHigh` scope and reclaim
+the Postgres container's cache from `pg_dump` afterwards; `CACHE_WRAP=` installs the plain line.
+
+Start the nightly early enough that the dump and the stage verify are done before `TRANSFER_WINDOW_UTC` opens, so
+the copy gets the whole window. Since 3.3.0 the run waits once for the window when it gets there early. Measure the
+dump on the real stage first, from the `creating local custom-format pg_dump` and `verify local stage: ok` lines of
+`logs/cron.log`, and leave a margin. In the setup this was written for, 12 fresh dumps of 36-37 GB took 58-67 min
+from the cron start, so a start at 05:10Z leaves about 40 min before a 07:00Z window. A start 2 h 20 min after the
+window opened left room for only about 23 GB at the paced rate, so a 37 GB dump needed two nights. Cron runs in
+server local time: with daylight saving time the start moves an hour earlier in UTC, and the run waits an hour
+longer.
+
+The runner wraps `backup_agent_memory_pg.sh run` in a watchdog (`BACKUP_TIMEOUT_SECONDS`, 10 h since runner 3.3.0;
+it was 6 h). It has to cover the early start, the 6 h window and the verify after the last step. On TERM the script
+deletes its unpublished transfer and raises an alert, so a watchdog that fires during the verify costs a whole copy.
+
+To move the schedule without moving the run that is already due (it may be resuming a paused copy),
+`install-cron --after-next-run` writes the new schedule to `state/install-cron-after-run.txt` and changes nothing
+else. When the next run that held the lock ends, whatever its exit code, the runner installs that schedule and
+deletes the file; a lock skip (exit 75) leaves it in place. A plain `install-cron` installs at once and replaces it.
 
 ## Restore
 

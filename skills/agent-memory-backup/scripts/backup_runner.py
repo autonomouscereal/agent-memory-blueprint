@@ -6,6 +6,13 @@ normal_backup_runner_20261018.py and writes the same receipt files:
 state/normal-run-<stamp>.public.json per run and state/reliability-run-exit.public.json
 for the latest. If the script ends non-zero without raising an alert itself (for
 example after a SIGKILL from the watchdog), the runner raises one.
+
+3.3.0 (2026-11-25): the watchdog default is 10 h (was 6 h). The nightly may start up to
+about three hours before the copy window opens and wait for it, and the window is 6 h,
+followed by the destination verify. After a run that held the lock (any exit but 75), the
+runner installs a cron schedule that `install-cron --after-next-run` left in
+state/install-cron-after-run.txt, so a schedule change takes effect after the run that was
+already due, never by moving it.
 """
 
 from __future__ import annotations
@@ -19,7 +26,7 @@ import subprocess
 import syslog
 import time
 
-RUNNER_VERSION = "3.2.1"
+RUNNER_VERSION = "3.3.0"
 SCRIPT = pathlib.Path(__file__).resolve().with_name("backup_agent_memory_pg.sh")
 ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 
@@ -61,7 +68,8 @@ def setting(name: str, default: str) -> str:
 HOME = pathlib.Path(setting("AGENT_MEMORY_BACKUP_HOME", str(pathlib.Path.home() / "agent-memory-backup")))
 STATE_DIR = pathlib.Path(setting("STATE_DIR", str(HOME / "state")))
 LOG_FILE = pathlib.Path(setting("LOG_DIR", str(HOME / "logs"))) / "cron.log"
-TIMEOUT_SECONDS = int(setting("BACKUP_TIMEOUT_SECONDS", "21600"))
+TIMEOUT_SECONDS = int(setting("BACKUP_TIMEOUT_SECONDS", "36000"))
+CRON_AFTER_RUN = STATE_DIR / "install-cron-after-run.txt"
 
 EXIT_MEANINGS = {
     0: "published; exactly one verified backup kept",
@@ -103,6 +111,24 @@ def wait_for_cleanup(limit_seconds: int = 90) -> float:
     return round(time.monotonic() - began, 1)
 
 
+def install_cron_after_run(code: int) -> str | None:
+    """3.3.0: after a run that held the lock, install the schedule `install-cron --after-next-run` left. The
+    file is deleted only when install-cron succeeds, so a failure is tried again after the next run."""
+    if code == 75 or not CRON_AFTER_RUN.exists():
+        return None
+    lines = CRON_AFTER_RUN.read_text(encoding="utf-8").splitlines()
+    schedule = lines[0].strip() if lines else ""
+    with LOG_FILE.open("ab") as log:
+        result = subprocess.run(
+            [str(SCRIPT), "install-cron"], env=dict(os.environ, CRON_SCHEDULE=schedule),
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, cwd=str(HOME.parent),
+        )
+    if result.returncode == 0:
+        CRON_AFTER_RUN.unlink(missing_ok=True)
+        return f"installed cron schedule {schedule}"
+    return f"install-cron exited {result.returncode}; {CRON_AFTER_RUN.name} kept for the next run"
+
+
 def main() -> int:
     started = utc_now()
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -114,6 +140,7 @@ def main() -> int:
         )
     code = result.returncode
     cleanup_wait_seconds = wait_for_cleanup() if code not in (0, 75) else 0.0
+    cron_after_run = install_cron_after_run(code)
     completed = utc_now()
 
     alert_raised_by_script = alert_path.exists() and alert_path.stat().st_mtime >= started.timestamp()
@@ -147,6 +174,8 @@ def main() -> int:
         "retention_hold": (STATE_DIR / "retention-hold").exists(),
         "alert_present": alert_path.exists(),
     }
+    if cron_after_run:
+        receipt["cron_after_run"] = cron_after_run
     stamp = completed.strftime("%Y%m%dT%H%M%SZ")
     write_exclusive(STATE_DIR / f"normal-run-{stamp}.public.json", receipt)
     write_atomic(STATE_DIR / "reliability-run-exit.public.json", receipt)
