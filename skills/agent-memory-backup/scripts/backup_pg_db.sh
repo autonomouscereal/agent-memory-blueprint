@@ -41,9 +41,13 @@
 # it releases it for every pool wait, and at each step it sees this shared lock and hands the share over. flock
 # wakes this job when the lock comes free, and it copies once its own pool gate reads OK. On 11-25 one database's
 # copy waited 09:51-13:00Z for the lock and was skipped.
+#
+# 2.3.0 (2026-11-26): MIRROR_COPY=0 turns the NAS copy (step 5) off. The local copy is then the restore point, the
+# job neither writes to nor reads from the share, the log's `backup complete` line ends in nas=off, and `mirror`
+# exits 1 without touching the share (MIRROR_COPY=1 on its command line copies once). Steps 1-4 and 6 are unchanged.
 set -Eeuo pipefail
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 
 # load_env_file <file>: the rules of load_env_file in backup_agent_memory_pg.sh (KEY=VALUE lines; a variable already
 # set in the environment wins over the file; nothing is expanded or executed).
@@ -72,6 +76,7 @@ DB_NAME="${DB_NAME:-}"
 CONTAINER_NAME="${CONTAINER_NAME:-agent-memory-postgres}"
 DEST_ROOT="${DEST_ROOT:-$HOME/pg-db-backups}"
 MIRROR_ROOT="${MIRROR_ROOT:-/mnt/nas/backups/pg-db-postgres}"
+MIRROR_COPY="${MIRROR_COPY:-1}"                       # 2.3.0: 0 = no NAS copy; the local copy is the restore point
 MIN_MIRROR_FREE_KB="${MIN_MIRROR_FREE_KB:-1048576}"   # free space the share must keep after the copy (1 GiB)
 KEEP_DAILY="${KEEP_DAILY:-14}"                        # newest dump of each of the 14 most recent backup days
 KEEP_WEEKLY="${KEEP_WEEKLY:-8}"                       # newest dump of each of the 8 most recent ISO weeks
@@ -308,6 +313,7 @@ validate_guard_config() {
   [[ "$POOL_STATE_MAX_AGE_SECONDS" =~ ^[0-9]+$ ]] || die "POOL_STATE_MAX_AGE_SECONDS must be a non-negative integer"
   [[ "$MIN_SYSTEM_FREE_KB" =~ ^[0-9]+$ ]] || die "MIN_SYSTEM_FREE_KB must be a non-negative integer"
   [[ "$MIRROR_CATCHUP_MAX" =~ ^[1-9][0-9]*$ ]] || die "MIRROR_CATCHUP_MAX must be a positive integer"
+  [[ "$MIRROR_COPY" == "0" || "$MIRROR_COPY" == "1" ]] || die "MIRROR_COPY must be 0 or 1"
   if [[ -n "$TRANSFER_DEADLINE_EPOCH" ]]; then
     [[ "$TRANSFER_DEADLINE_EPOCH" =~ ^[0-9]+$ ]] || die "TRANSFER_DEADLINE_EPOCH must be an epoch second"
   else
@@ -353,6 +359,12 @@ mirror_missing_ids() {
 mirror_copy() {
   local id="$1" dest="$2" size="$3" mdir="$MIRROR_ROOT/$DB_NAME" free_kb need_kb end now wait_s low cid ids
   local copied=0 failed=0
+  # 2.3.0: with the NAS copy off nothing touches the share, not even a read.
+  if [[ "$MIRROR_COPY" == "0" ]]; then
+    MIRROR_STATE="off"
+    log "NAS copy off (MIRROR_COPY=0); the local copy is the restore point"
+    return 0
+  fi
   end="$(transfer_window_end)"
   if (( end == 0 )); then
     MIRROR_STATE="skipped-window"
@@ -480,7 +492,8 @@ run_locked() {
   if low_space="$(low_free_space)"; then die "refusing to stage: $low_space; the previous backups are kept"; fi
   trap on_exit EXIT
 
-  local dest="$DEST_ROOT/$DB_NAME" ts backup_id
+  local dest="$DEST_ROOT/$DB_NAME" ts backup_id nas_copy="$MIRROR_ROOT/$DB_NAME"
+  [[ "$MIRROR_COPY" == "1" ]] || nas_copy="off"
   mkdir -p "$dest/dumps" "$dest/manifests" "$dest/restore-lists" "$dest/incoming" "$LOG_DIR"
   ts="$(date -u '+%Y%m%dT%H%M%SZ')"
   backup_id="${DB_NAME}_${ts}"
@@ -494,7 +507,7 @@ run_locked() {
 
   # the run row is inserted after the snapshot, so it is not part of this dump or its counts
   lab_start "$backup_id" "$dest" "$(printf '{"database": "%s", "backup_id": "%s", "tool": "backup_pg_db.sh %s", "container": "%s", "snapshot": "%s", "dest": "%s", "nas": "%s", "retention": {"daily": %s, "weekly": %s, "recent_hours": %s}}' \
-    "$DB_NAME" "$backup_id" "$VERSION" "$CONTAINER_NAME" "$SNAPSHOT" "$dest" "$MIRROR_ROOT/$DB_NAME" "$KEEP_DAILY" "$KEEP_WEEKLY" "$KEEP_RECENT_HOURS")"
+    "$DB_NAME" "$backup_id" "$VERSION" "$CONTAINER_NAME" "$SNAPSHOT" "$dest" "$nas_copy" "$KEEP_DAILY" "$KEEP_WEEKLY" "$KEEP_RECENT_HOURS")"
 
   log "pg_dump --format=custom --snapshot=$SNAPSHOT -> $INC/$backup_id.dump"
   docker exec -e PGDB="$DB_NAME" -e SNAP="$SNAPSHOT" "$CONTAINER_NAME" sh -c \
@@ -558,7 +571,11 @@ run_locked() {
                {gsub(/["\\]/, "_", $1); printf "%s\"%s\": {\"source\": %s, \"restored\": %s}", (n++ ? ", " : ""), $1, $2, r[$1]}' \
       "$INC/restore_counts.txt" "$INC/source_counts.txt"
     printf '},\n  "retention": {"daily": %s, "weekly": %s, "recent_hours": %s},\n' "$KEEP_DAILY" "$KEEP_WEEKLY" "$KEEP_RECENT_HOURS"
-    printf '  "copies": ["%s", "%s"]\n}\n' "$dest/dumps/$backup_id.dump" "$MIRROR_ROOT/$DB_NAME/$backup_id.dump"
+    if [[ "$MIRROR_COPY" == "1" ]]; then
+      printf '  "copies": ["%s", "%s"]\n}\n' "$dest/dumps/$backup_id.dump" "$MIRROR_ROOT/$DB_NAME/$backup_id.dump"
+    else
+      printf '  "copies": ["%s"]\n}\n' "$dest/dumps/$backup_id.dump"
+    fi
   } > "$INC/$backup_id.manifest.json"
 
   mv "$INC/$backup_id.dump" "$INC/$backup_id.dump.sha256" "$dest/dumps/"
@@ -573,11 +590,13 @@ run_locked() {
 
   mirror_copy "$backup_id" "$dest" "$size"
 
-  local nas_ok=0
+  local nas_ok=0 nas_metric=()
   [[ "$MIRROR_STATE" != "verified" ]] || nas_ok=1
+  # 2.3.0: with the NAS copy off there is no copy to report as verified or not.
+  [[ "$MIRROR_STATE" == "off" ]] || nas_metric=(--metric "nas_copy_verified=$nas_ok")
   lab_end pass 0 "$dest/manifests/$backup_id.manifest.json" \
     --metric "size_bytes=$size" --metric "tables=$n_tables" --metric "source_rows=$n_src_rows" \
-    --metric "restored_rows=$n_rst_rows" --metric "tables_mismatched=0" --metric "nas_copy_verified=$nas_ok"
+    --metric "restored_rows=$n_rst_rows" --metric "tables_mismatched=0" "${nas_metric[@]}"
   log "backup complete: $dest/dumps/$backup_id.dump size=$size sha256=$sha nas=$MIRROR_STATE"
 }
 
@@ -608,7 +627,7 @@ install_cron() {
   crontab -l 2>/dev/null > "$LOCK_DIR/crontab.before-pg-db-backup-$(date -u '+%Y%m%dT%H%M%SZ').txt" || true
   {
     crontab -l 2>/dev/null | sed '/# BEGIN pg-db-backup/,/# END pg-db-backup/d' || true
-    echo "# BEGIN pg-db-backup (backup_pg_db.sh $VERSION: $CRON_DBS -> $DEST_ROOT + NAS $MIRROR_ROOT, ${KEEP_DAILY}d+${KEEP_WEEKLY}w)"
+    echo "# BEGIN pg-db-backup (backup_pg_db.sh $VERSION: $CRON_DBS -> $DEST_ROOT$([[ "$MIRROR_COPY" == "1" ]] && echo " + NAS $MIRROR_ROOT" || echo " (NAS copy off)"), ${KEEP_DAILY}d+${KEEP_WEEKLY}w)"
     printf '%s CRON_DBS="%s" %s%s run-all >> %s 2>&1\n' "$CRON_SCHEDULE" "$CRON_DBS" "$wrap" "$SCRIPT_PATH" "$LOG_FILE"
     echo '# END pg-db-backup'
   } > "$tmp"
@@ -623,12 +642,18 @@ status() {
     echo "== $db"
     if [[ -f "$DEST_ROOT/$db/latest_backup_id.txt" ]]; then cat "$DEST_ROOT/$db/latest_backup_id.txt"; else echo "no backup yet"; fi
     ls -la "$DEST_ROOT/$db/dumps" 2>/dev/null | tail -n 6 || true
-    echo "-- NAS $MIRROR_ROOT/$db"
-    timeout 30 ls -la "$MIRROR_ROOT/$db" 2>/dev/null | tail -n 6 || echo "unavailable"
+    if [[ "$MIRROR_COPY" == "1" ]]; then
+      echo "-- NAS $MIRROR_ROOT/$db"
+      timeout 30 ls -la "$MIRROR_ROOT/$db" 2>/dev/null | tail -n 6 || echo "unavailable"
+    fi
   done
   crontab -l 2>/dev/null | sed -n '/# BEGIN pg-db-backup/,/# END pg-db-backup/p' || true
-  pool_state_ok || true
-  echo "NAS copy: --bwlimit=$BWLIMIT_KBPS KiB/s, window ${TRANSFER_DEADLINE_EPOCH:-$TRANSFER_WINDOW_UTC UTC}, pool state: $POOL_STATE_LINE, share-copy lock: $SHARE_COPY_LOCK (wait lock $SHARE_WAIT_LOCK)"
+  if [[ "$MIRROR_COPY" == "1" ]]; then
+    pool_state_ok || true
+    echo "NAS copy: --bwlimit=$BWLIMIT_KBPS KiB/s, window ${TRANSFER_DEADLINE_EPOCH:-$TRANSFER_WINDOW_UTC UTC}, pool state: $POOL_STATE_LINE, share-copy lock: $SHARE_COPY_LOCK (wait lock $SHARE_WAIT_LOCK)"
+  else
+    echo "NAS copy: off (MIRROR_COPY=0); the local copies in $DEST_ROOT are the restore points"
+  fi
 }
 
 restore_help() {

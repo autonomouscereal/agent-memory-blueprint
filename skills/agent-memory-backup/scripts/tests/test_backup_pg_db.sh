@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Tests for backup_pg_db.sh 2.1.x's NAS-copy guards (2026-11-24): the copy window, the pool gate, the
 # share-copy lock shared with backup_agent_memory_pg.sh (and 2.2.0's wait lock beside it), --bwlimit, the 20 GB
-# free-space floor and the catch-up of skipped copies. The hand-over between the two jobs is tested with both real
+# free-space floor and the catch-up of skipped copies; 2.3.0's MIRROR_COPY=0 (no NAS copy) with `mirror`, a whole
+# run and status (section 13, which has its own fuller fake docker). The hand-over between the two jobs is tested with both real
 # scripts in test_backup_agent_memory_pg.sh, section 23. Uses the `mirror` command on a fake local backup tree with
 # random dumps; a tiny fake docker serves the run path's first checks. Everything lives in a temp dir; no real backup
 # path is touched.
@@ -230,6 +231,68 @@ wait
 check "wait lock: held exclusively past the deadline exits 1" rc_is 1
 check "wait lock: the skip is logged" grep -q 'the share-copy wait lock stayed held until the window end' "$OUT"
 check "wait lock: nothing was written" not_on_share "$H2"
+
+# 13. 2.3.0: MIRROR_COPY=0 turns the NAS copy off. `mirror` exits 1 and leaves the share as it was (no write, no
+#     rsync); a full run publishes the local backup, logs nas=off and lists only the local copy in its manifest. With
+#     the default (MIRROR_COPY=1) the same run still copies and logs nas=verified.
+new_env 13
+mkdir -p "$WORK/bin13"
+cat > "$WORK/bin13/docker" <<'SHIM'
+#!/usr/bin/env bash
+# Fake docker for a whole run: the snapshot psql session, the table count, pg_dump, pg_restore (--list and into the
+# test database), createdb and dropdb. One table, public.t, with 3 rows on both sides.
+case "$1" in inspect) echo true; exit 0 ;; exec) ;; *) exit 2 ;; esac
+shift; args="$*"
+if [[ "$args" == *"pg_dump "* ]]; then printf 'PGDMP fake dump\n'; seq 1 2000; exit 0; fi
+if [[ "$args" == *"pg_restore --list"* ]]; then cat > /dev/null; printf ';\n; TOC Entries: 2\n1; 0 0 TABLE public t x\n'; exit 0; fi
+if [[ "$args" == *pg_restore* ]]; then cat > /dev/null; exit 0; fi
+if [[ "$args" == *createdb* || "$args" == *dropdb* ]]; then exit 0; fi
+if [[ "$args" == *psql* ]]; then
+  while IFS= read -r line; do
+    case "$line" in
+      *pg_export_snapshot*) echo "SNAP|00000003-0000001B-1" ;;
+      *"FROM pg_tables"*) echo "public.t|3" ;;
+      *__END__*) echo "__END__" ;;
+      *"FROM pg_database"*) echo 1 ;;
+      '\q') exit 0 ;;
+    esac
+  done
+  exit 0
+fi
+exit 2
+SHIM
+chmod +x "$WORK/bin13/docker"
+make_backup 20261126T095000Z; J="$LAST"
+: > "$FAKE_STATE/rsync_args"
+mnt_snap() { find "$E/mnt" -printf '%p %s %T@ %m\n' | sort; }
+MNT_BEFORE="$(mnt_snap)"
+run_cmd offmirror mirror MIRROR_COPY=0
+check "NAS copy off: mirror exits 1" rc_is 1
+check "NAS copy off: mirror says so" grep -q 'NAS copy off (MIRROR_COPY=0); the local copy is the restore point' "$OUT"
+check "NAS copy off: mirror wrote nothing to the share" not_on_share "$J"
+check "NAS copy off: no rsync ran" test ! -s "$FAKE_STATE/rsync_args"
+check "NAS copy off: the share is exactly as it was" test "$MNT_BEFORE" = "$(mnt_snap)"
+run_cmd badoff mirror MIRROR_COPY=maybe
+check "NAS copy setting: a value other than 0 or 1 is refused (exit 1)" rc_is 1
+check "NAS copy setting: the refusal names MIRROR_COPY" grep -q 'MIRROR_COPY must be 0 or 1' "$OUT"
+sleep 1.1
+run_cmd offrun run MIRROR_COPY=0 PATH="$WORK/bin13:$PATH"
+OFF_ID="$(tr -d '\n' < "$DEST_ROOT/labdb/latest_backup_id.txt")"
+check "NAS copy off: a run exits 0" rc_is 0
+check "NAS copy off: the run publishes a new local backup" bash -c "[[ '$OFF_ID' != '$J' && -s '$DEST_ROOT/labdb/dumps/$OFF_ID.dump' ]]"
+check "NAS copy off: its backup complete line ends in nas=off" grep -q "] backup complete: $DEST_ROOT/labdb/dumps/$OFF_ID.dump size=[0-9]* sha256=[0-9a-f]* nas=off$" "$E/logs/pg.log"
+check "NAS copy off: the manifest lists only the local copy" grep -qxF "  \"copies\": [\"$DEST_ROOT/labdb/dumps/$OFF_ID.dump\"]" "$DEST_ROOT/labdb/manifests/$OFF_ID.manifest.json"
+check "NAS copy off: the run wrote nothing to the share" test "$MNT_BEFORE" = "$(mnt_snap)"
+check "NAS copy off: no rsync ran in the run" test ! -s "$FAKE_STATE/rsync_args"
+sleep 1.1
+run_cmd onrun run PATH="$WORK/bin13:$PATH"
+ON_ID="$(tr -d '\n' < "$DEST_ROOT/labdb/latest_backup_id.txt")"
+check "NAS copy on (default): a run exits 0" rc_is 0
+check "NAS copy on (default): its backup complete line ends in nas=verified" grep -q "] backup complete: $DEST_ROOT/labdb/dumps/$ON_ID.dump .* nas=verified$" "$E/logs/pg.log"
+check "NAS copy on (default): the dump is verified on the share" on_share "$ON_ID"
+run_cmd offstatus status MIRROR_COPY=0 CRON_DBS=labdb
+check "NAS copy off: status says the NAS copy is off" grep -q 'NAS copy: off (MIRROR_COPY=0)' "$OUT"
+check "NAS copy off: status lists no NAS folder" bash -c "! grep -q -- '-- NAS ' '$OUT'"
 
 echo "# passed $PASS failed $FAIL"
 [[ "$FAIL" == 0 ]]

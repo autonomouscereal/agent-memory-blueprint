@@ -1,6 +1,6 @@
 ---
 name: agent-memory-backup
-description: Back up, verify, schedule and restore-test the agent-memory PostgreSQL database (agent_memory in the agent-memory-postgres container), keeping exactly one verified backup on a NAS share. Use when asked to back up memory, make a restore point before a risky change, check the latest backup, run or schedule the nightly job, restore-test a dump, or back up the smaller databases in the same container.
+description: Back up, verify, schedule and restore-test the agent-memory PostgreSQL database (agent_memory in the agent-memory-postgres container), keeping exactly one verified backup on a NAS share or a local drive. Use when asked to back up memory, make a restore point before a risky change, check the latest backup, run or schedule the nightly job, restore-test a dump, or back up the smaller databases in the same container.
 ---
 
 # Agent Memory Backup
@@ -11,7 +11,7 @@ and none is stored. No ORM, SQLAlchemy, Pydantic, SQLite or Chroma.
 
 | File (in `scripts/`) | What it does |
 |---|---|
-| `backup_agent_memory_pg.sh` | Dump `agent_memory`, copy it to the share in paced steps, verify, publish, then delete every other backup |
+| `backup_agent_memory_pg.sh` | Dump `agent_memory`, copy it to the share in paced steps (or, since 3.4.0, move it into place on a local drive), verify, publish, then delete every other backup |
 | `backup_runner.py` | Cron entrypoint: runs the script under a 10 h watchdog, writes an exit receipt, installs a schedule left for after the run |
 | `restore_test_agent_memory.sh` | Weekly full restore of the published dump into a throwaway container, exact row counts against live |
 | `backup_pg_db.sh` | The smaller databases in the same container: snapshot dump, restore test, local + NAS copies, daily/weekly rotation |
@@ -55,6 +55,7 @@ DB, and `status` reported a stale dump on the share with "alert: none". With the
 |---|---|---|
 | `MOUNTPOINT` | `/mnt/nas` | The share's mount point (an automount is fine) |
 | `DEST_ROOT` | `$MOUNTPOINT/backups/agent-memory-postgres` | Where the one verified backup is published |
+| `DEST_LOCAL` | `0` | `1`: `DEST_ROOT` is a local drive on `LOCAL_STAGING`'s filesystem; the stage is moved into place (see "Local destination (3.4.0)") |
 | `LOCAL_STAGING` | `$HOME/agent-memory-backup/staging` | Local stage for the dump; not the disk that holds the live Postgres |
 | `POOL_STATE_FILE` | `$MOUNTPOINT/.nas-tuning/pool_state` | `OK\|BUSY <utc> ...` line written by a probe on the NAS side |
 | `CACHE_WRAP` | empty | Command `install-cron` puts in front of the runner when its first word is executable |
@@ -147,6 +148,28 @@ Alerts go to `state/alert.json` (the current one; a clean run removes it), `stat
 journal (`journalctl -t agent-memory-backup`) and `ALERT_COMMAND` if set (it receives the alert JSON path). Each
 cron run writes `state/normal-run-<stamp>.public.json` and `state/reliability-run-exit.public.json`; if the script
 dies without an alert (for example after a watchdog SIGKILL) the runner raises one.
+
+## Local destination (3.4.0)
+
+With `DEST_LOCAL=1` the one verified backup is published on a local drive instead of a NAS share, for a setup where
+writes to the share hurt its host. Set `MOUNTPOINT` to the drive's mount point and `DEST_ROOT` to a directory on the
+same filesystem as `LOCAL_STAGING`.
+
+- Preflight refuses when `MOUNTPOINT` is not a mount point (unmounted, it is a plain directory on the root disk, and
+  nothing is created under it) and when `DEST_ROOT` and `LOCAL_STAGING` are on different filesystems.
+- Step 4 above becomes one rename of the verified stage's dump into `incoming/<backup-id>/`; the manifest and restore
+  list are copied beside it. Nothing reads a pool state, waits for a window, paces or takes the share-copy lock, so a
+  run never pauses (no exit 4).
+- Steps 5-7 are unchanged: size, SHA-256 and a complete `pg_restore --list` of the moved file, the renames and the
+  pointer swap, and only then the deletion of every other published backup.
+- A run that stops before publication (a verify failure, a watchdog TERM) moves the dump back into its stage, which
+  stays pending; the next run re-hashes it and publishes it, or discards it if the hash no longer matches.
+- Capacity: the destination needs no room for a second copy. The drive needs one published dump plus the next stage
+  (expected size + 15 %) plus `LOCAL_MIN_FREE_KB`, and on restore-test days the test's image as well.
+- Switching from a share: the old share is never written. Its published backup, pointer and any paused partial stay
+  as they are until an operator deletes them. A paused-copy marker that names the share is discarded as stale.
+- `status` prints `publish: local move` and reads no pool state; `latest.json` and the runner's receipt name the
+  destination (`destination_root`) and the mode (`publish`).
 
 ## Transfer to the share
 
@@ -321,6 +344,9 @@ hold at least the manifest counts.
   backup. `DB_NAME=<db> backup_pg_db.sh mirror` runs only the NAS copy.
 - With `RECORD_RUN=1` each backup is also a run row in an external run-log CLI (`LAB_DIR`, `LAB_PY`, `LAB_CLI`,
   credentials in `LAB_ENV_FILE`), best effort.
+- `MIRROR_COPY=0` (2.3.0) turns the NAS copy off: the job neither writes to nor reads from the share, the local copy
+  is the only one, the log line ends in `nas=off`, the manifest lists only the local copy, and `mirror` exits 1
+  without touching the share (`MIRROR_COPY=1 DB_NAME=<db> bin/backup_pg_db.sh mirror` copies once).
 - A failed run deletes its `incoming/<id>` directory and drops the test database.
 
 ```bash

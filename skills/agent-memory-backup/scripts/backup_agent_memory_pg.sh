@@ -42,9 +42,18 @@
 # when the next run ends, so a schedule change never moves the run that is already due. With the 02:20 local start
 # a 37 GB fresh dump reached the copy at about 10:25Z and needed two nights; started at 22:10 local (05:10Z) it is
 # ready by about 06:15Z and the window holds about 52 GB at the 11-25 pace.
+#
+# 3.4.0 (2026-11-26): DEST_LOCAL=1 publishes on a local drive instead of the NAS share. DEST_ROOT must then sit on the
+# same filesystem as LOCAL_STAGING, and MOUNTPOINT must be that filesystem's mount point (an unmounted mount point is
+# a plain directory on the root disk). The verified stage's dump is moved into incoming/<backup-id>/ with one rename:
+# no byte is copied, so there is no pool gate, copy window, pacing or share-copy lock. Verify, publish and
+# delete-after-publish are unchanged, so the previous backup is deleted only after the new one is verified and
+# published. A run that stops before publication moves the dump back into its stage, which stays pending for the
+# next run (that run re-hashes it before it uses it). In the setup this was written for, the share's SMR disks sat on
+# the same controller as the NAS host's boot drive, and the nightly's 37 GB write stalled the whole host.
 set -Eeuo pipefail
 
-SCRIPT_VERSION="3.3.0"
+SCRIPT_VERSION="3.4.0"
 
 # load_env_file <file>: set each KEY=VALUE of <file> that is not already set, so a variable from the environment (a
 # cron line, a test, an operator's override) wins over the file. Blank lines and # comments are skipped, an
@@ -73,6 +82,9 @@ load_env_file "$BACKUP_ENV_FILE"
 CONTAINER_NAME="${CONTAINER_NAME:-agent-memory-postgres}"
 MOUNTPOINT="${MOUNTPOINT:-/mnt/nas}"
 DEST_ROOT="${DEST_ROOT:-$MOUNTPOINT/backups/agent-memory-postgres}"
+# 3.4.0: 1 when DEST_ROOT is on a local drive, on the same filesystem as LOCAL_STAGING; the stage is moved into place
+# instead of copied to a share (see the header). 0 (the default) is the paced copy to the NAS share.
+DEST_LOCAL="${DEST_LOCAL:-0}"
 # 3.1.0 (2026-11-21): the dump is staged on a local drive with room for it, not on the root disk that holds the live
 # Postgres. From 11-05 to 11-11 the root disk had too little room, and the cron line then overrode staging AND the
 # destination to the local drive, so the one verified backup sat on the same machine as the live DB and status/list
@@ -158,6 +170,8 @@ CLEANUP_FAILURES=0
 VERIFY_TMP=""
 MANIFEST_FIELDS=()
 PENDING_FIELDS=()
+# 3.4.0 (DEST_LOCAL=1): where this run moved the stage's dump, so on_exit can move it back before publication.
+MOVED_DUMP=""
 STEP_PID=""
 STEP_TIMED_OUT=0
 PAUSE_REASON=""
@@ -171,8 +185,8 @@ Commands:
   run             Dump, verify the destination copy, publish it, then delete every other backup
   dry-run         Show what run would do against the real paths, verify the published backup; change nothing
   verify [id]     Verify a published backup (default: latest): size + SHA-256 vs manifest, complete pg_restore --list
-  status          Show media mount, latest pointer, published backups, alert, schedule
-  list            List published dump files on media storage
+  status          Show the destination's mount, latest pointer, published backups, alert, schedule
+  list            List the published dump files in DEST_ROOT
   install-cron    Install or refresh the daily user crontab entry (saves the old crontab first)
                   --after-next-run: leave it for backup_runner.py to install when the next run ends
   uninstall-cron  Remove this script's managed crontab block
@@ -186,7 +200,9 @@ Exit codes: 0 published; 1 failed (previous kept); 3 published, cleanup incomple
 
 Configuration: environment variables, or KEY=VALUE lines in agent-memory-backup.env beside this
 script (AGENT_MEMORY_BACKUP_ENV names another file). The environment wins over the file.
-  MOUNTPOINT             The NAS share's mount point. Default: /mnt/nas
+  MOUNTPOINT             The NAS share's (or, with DEST_LOCAL=1, the local drive's) mount point. Default: /mnt/nas
+  DEST_LOCAL             1: DEST_ROOT is a local drive on LOCAL_STAGING's filesystem; the stage is moved into place
+                         with no pool gate, window, pacing or share-copy lock. Default: 0 (paced copy to the share)
   BWLIMIT_KBPS           rsync throttle in KiB/s for the dump copy. Default: 6000
   PACE_STEP_SECONDS      Length of one paced copy step. Default: 600
   PACE_BUSY_WAIT_SECONDS Wait before re-reading a BUSY/missing/stale pool state. Default: 900
@@ -258,6 +274,11 @@ ensure_mount_once() {
   mkdir -p "$MOUNTPOINT" >/dev/null 2>&1 || return 1
   ls "$MOUNTPOINT" >/dev/null 2>&1 || return 1
   findmnt -T "$MOUNTPOINT" >/dev/null 2>&1 || return 1
+  # 3.4.0: a local destination must be the mounted drive itself. Unmounted, its mount point is a plain directory on
+  # the root disk, and the directories below would be created there.
+  if [[ "$DEST_LOCAL" == "1" ]]; then
+    mountpoint -q "$MOUNTPOINT" || return 1
+  fi
   mkdir -p "$DEST_ROOT/dumps" "$DEST_ROOT/manifests" "$DEST_ROOT/restore-lists" "$DEST_ROOT/incoming" "$DEST_ROOT/logs" >/dev/null 2>&1 || return 1
   [[ -w "$DEST_ROOT" ]] || return 1
 }
@@ -285,6 +306,49 @@ ensure_mount() {
 
 available_kb_of() {
   df -Pk "$1" 2>/dev/null | awk 'NR > 1 && $4 ~ /^[0-9]+$/ { value = $4 } END { print value }'
+}
+
+# 3.4.0: DEST_LOCAL must be 0 or 1, and with 1 the stage must be movable into DEST_ROOT with a rename: both on one
+# filesystem. Checked at preflight, after ensure_mount has created DEST_ROOT's directories on the mounted drive.
+validate_destination_mode() {
+  [[ "$DEST_LOCAL" == "0" || "$DEST_LOCAL" == "1" ]] || die "DEST_LOCAL must be 0 or 1"
+  [[ "$DEST_LOCAL" == "1" ]] || return 0
+  local dest_dev stage_dev
+  dest_dev="$(stat -c '%d' "$DEST_ROOT/incoming" 2>/dev/null || true)"
+  stage_dev="$(stat -c '%d' "$LOCAL_STAGING" 2>/dev/null || true)"
+  [[ -n "$dest_dev" && "$dest_dev" == "$stage_dev" ]] ||
+    die "DEST_LOCAL=1 needs DEST_ROOT and LOCAL_STAGING on one filesystem, so the stage can be moved into place: $DEST_ROOT (device ${dest_dev:-unknown}) and $LOCAL_STAGING (device ${stage_dev:-unknown})"
+}
+
+# 3.4.0 (DEST_LOCAL=1): move the verified stage's dump into <dest_dir>/ with one rename (one filesystem, checked at
+# preflight). No byte is copied, so nothing waits for a pool state, a window or the share-copy lock. MOVED_DUMP
+# names the dump's new place, so a run that stops before publication can move it back into its stage.
+#   local_move <src> <dest_dir>
+local_move() {
+  local src="$1" dest_dir="$2" dest
+  dest="$dest_dir/$(basename "$src")"
+  mv -T -- "$src" "$dest" || return 1
+  MOVED_DUMP="$dest"
+  [[ -f "$dest" && ! -e "$src" ]] || return 1
+  log "moved the verified dump into $dest_dir (one rename on the same filesystem; nothing copied)"
+}
+
+# 3.4.0 (DEST_LOCAL=1): an unpublished run moves its dump back into the stage it came from, before on_exit deletes
+# this run's incoming copy, so a verified stage named in pending-stage.txt stays whole for the next run.
+return_dump_to_stage() {
+  [[ "$DEST_LOCAL" == "1" && "$TRANSFER_STARTED" == "1" && -n "$BACKUP_ID" ]] || return 0
+  [[ -n "$TMP_DIR" && "$TMP_DIR" == "$LOCAL_STAGING"/agent_memory_* && -d "$TMP_DIR" ]] || return 0
+  [[ ! -e "$TMP_DIR/${BACKUP_ID}.dump" ]] || return 0
+  local from
+  for from in "$MOVED_DUMP" "${DEST_INCOMING:+$DEST_INCOMING/${BACKUP_ID}.dump}"; do
+    [[ -n "$from" && -f "$from" ]] || continue
+    if mv -T -- "$from" "$TMP_DIR/${BACKUP_ID}.dump"; then
+      log "moved the unpublished dump back into its stage: $TMP_DIR"
+    else
+      log "WARN: could not move the unpublished dump back into its stage: $from"
+    fi
+    return 0
+  done
 }
 
 # Expected size in KiB with growth headroom: the dump being resumed, else the
@@ -1000,6 +1064,9 @@ on_exit() {
     log "kept the paused copy for the next run: $DEST_INCOMING"
     log "kept verified unpublished stage for the next run: $TMP_DIR"
   else
+    # 3.4.0 (DEST_LOCAL=1): the dump was moved, not copied, out of its stage. Move it back before anything below
+    # deletes this run's unpublished files.
+    return_dump_to_stage
     # A publication interrupted before the pointer swap is rolled back: the
     # previous backup stays the published one and the stage is retried later.
     if [[ "$PHASE" == "publish" && -n "$BACKUP_ID" ]]; then
@@ -1067,6 +1134,8 @@ write_latest_state() {
   "payload_archive_count": $archive_count,
   "latest_event_id": $latest_event_id,
   "database_size": "$db_size",
+  "destination_root": "$DEST_ROOT",
+  "publish": "$([[ "$DEST_LOCAL" == "1" ]] && echo local-move || echo paced-copy)",
   "bwlimit_kbps": $BWLIMIT_KBPS,
   "retention": "one-verified",
   "script_version": "$SCRIPT_VERSION"
@@ -1087,6 +1156,7 @@ run_backup_locked() {
   ensure_base_tools
   ensure_container
   ensure_mount
+  validate_destination_mode
   validate_pacing_config
   local low_space=""
   if low_space="$(low_free_space)"; then
@@ -1116,7 +1186,13 @@ run_backup_locked() {
   else
     expected_size="$(latest_published_size)"
   fi
-  required_kb=$(( $(expected_dump_kb "$expected_size") + MIN_DEST_FREE_KB ))
+  if [[ "$DEST_LOCAL" == "1" ]]; then
+    # 3.4.0: the stage is moved into place, so the destination needs no room for a second copy; the staging check
+    # below covers the dump itself.
+    required_kb="$MIN_DEST_FREE_KB"
+  else
+    required_kb=$(( $(expected_dump_kb "$expected_size") + MIN_DEST_FREE_KB ))
+  fi
   if ! available_kb="$(probe_destination_capacity "$required_kb")"; then
     die "destination capacity remained unavailable or below ${required_kb} KiB after ${CAPACITY_PROBE_ATTEMPTS} probes: $DEST_ROOT"
   fi
@@ -1217,27 +1293,35 @@ EOF
   DEST_INCOMING="$dest_incoming"
   TRANSFER_STARTED=1
   mkdir -p "$dest_incoming"
-  log "copying $backup_id to $dest_incoming with rsync --bwlimit=$BWLIMIT_KBPS KiB/s in steps of ${PACE_STEP_SECONDS}s (pool gate $([[ "$PACE_GATE" == "1" ]] && echo "on: $POOL_STATE_FILE" || echo off), window ${TRANSFER_DEADLINE_EPOCH:+deadline }${TRANSFER_DEADLINE_EPOCH:-$TRANSFER_WINDOW_UTC UTC})"
-  # Copy only the unpublished incoming dump sequentially: CIFS delta reconstruction
-  # rereads/rebuilds the retained prefix. Keep the throttle and verify the full SHA-256.
-  # 3.2.0: paced, gated steps that append to the partial; a pause keeps it for the next run. --append writes from
-  # the receiver's current length and never rereads the prefix (rsync refuses it together with --whole-file).
-  local copy_status=0
-  paced_copy "$tmp_dump" "$dest_incoming" "$resume_partial" || copy_status=$?
-  if [[ "$copy_status" -eq "$EXIT_PAUSED" ]]; then
-    PHASE="transfer-paused"
-    printf '%s\n%s\n' "$dest_incoming" "paused $(date -u '+%Y-%m-%dT%H:%M:%SZ'): $PAUSE_REASON" > "$PAUSED_FILE.tmp"
-    mv "$PAUSED_FILE.tmp" "$PAUSED_FILE"
-    log "transfer paused: $PAUSE_REASON; $(stat -c '%s' "$dest_incoming/${backup_id}.dump" 2>/dev/null || echo 0) of $size_bytes bytes copied; the next run resumes $dest_incoming"
-    exit "$EXIT_PAUSED"
-  elif [[ "$copy_status" -ne 0 ]]; then
-    die "transfer of the dump failed"
+  if [[ "$DEST_LOCAL" == "1" ]]; then
+    # 3.4.0: a local destination on the stage's filesystem: one rename, no copy, no pool gate, window, pacing or
+    # share-copy lock. The stage keeps its manifest and restore list (the verify below compares against them).
+    log "moving $backup_id into $dest_incoming (local destination, DEST_LOCAL=1)"
+    local_move "$tmp_dump" "$dest_incoming" || die "moving the dump into $dest_incoming failed"
+    cp -- "$tmp_manifest" "$tmp_restore_list" "$dest_incoming/" || die "copying the manifest/restore list failed"
+  else
+    log "copying $backup_id to $dest_incoming with rsync --bwlimit=$BWLIMIT_KBPS KiB/s in steps of ${PACE_STEP_SECONDS}s (pool gate $([[ "$PACE_GATE" == "1" ]] && echo "on: $POOL_STATE_FILE" || echo off), window ${TRANSFER_DEADLINE_EPOCH:+deadline }${TRANSFER_DEADLINE_EPOCH:-$TRANSFER_WINDOW_UTC UTC})"
+    # Copy only the unpublished incoming dump sequentially: CIFS delta reconstruction
+    # rereads/rebuilds the retained prefix. Keep the throttle and verify the full SHA-256.
+    # 3.2.0: paced, gated steps that append to the partial; a pause keeps it for the next run. --append writes from
+    # the receiver's current length and never rereads the prefix (rsync refuses it together with --whole-file).
+    local copy_status=0
+    paced_copy "$tmp_dump" "$dest_incoming" "$resume_partial" || copy_status=$?
+    if [[ "$copy_status" -eq "$EXIT_PAUSED" ]]; then
+      PHASE="transfer-paused"
+      printf '%s\n%s\n' "$dest_incoming" "paused $(date -u '+%Y-%m-%dT%H:%M:%SZ'): $PAUSE_REASON" > "$PAUSED_FILE.tmp"
+      mv "$PAUSED_FILE.tmp" "$PAUSED_FILE"
+      log "transfer paused: $PAUSE_REASON; $(stat -c '%s' "$dest_incoming/${backup_id}.dump" 2>/dev/null || echo 0) of $size_bytes bytes copied; the next run resumes $dest_incoming"
+      exit "$EXIT_PAUSED"
+    elif [[ "$copy_status" -ne 0 ]]; then
+      die "transfer of the dump failed"
+    fi
+    rm -f -- "$PAUSED_FILE"
+    rsync_with_retry -a --inplace --whole-file --ignore-times "$tmp_manifest" "$tmp_restore_list" "$dest_incoming/" ||
+      die "transfer of the manifest/restore list failed"
+    # 3.2.3: every file of the backup is on the share; the verify below only reads it.
+    share_lock_release
   fi
-  rm -f -- "$PAUSED_FILE"
-  rsync_with_retry -a --inplace --whole-file --ignore-times "$tmp_manifest" "$tmp_restore_list" "$dest_incoming/" ||
-    die "transfer of the manifest/restore list failed"
-  # 3.2.3: every file of the backup is on the share; the verify below only reads it.
-  share_lock_release
 
   PHASE="verify-destination"
   cmp -s "$tmp_manifest" "$dest_incoming/${backup_id}.manifest.json" || die "destination manifest differs from the staged manifest"
@@ -1252,6 +1336,7 @@ EOF
   mv "$dest_incoming/${backup_id}.restore.list" "$dest_restore_list"
   mv "$dest_incoming/${backup_id}.manifest.json" "$dest_manifest"
   mv "$dest_incoming/${backup_id}.dump" "$dest_dump"
+  [[ -z "$MOVED_DUMP" ]] || MOVED_DUMP="$dest_dump"
   rmdir "$dest_incoming" 2>/dev/null || true
   [[ "$(stat -c '%s' "$dest_dump")" == "$size_bytes" ]] || die "published dump size changed during rename"
   printf '%s\n' "$backup_id" > "$DEST_ROOT/latest_backup_id.txt.tmp"
@@ -1281,20 +1366,25 @@ dry_run_report() {
     new_id="agent_memory_$(date -u '+%Y%m%dT%H%M%SZ')"
     log "DRY-RUN would create a fresh dump ($new_id) in $LOCAL_STAGING"
   fi
-  log "DRY-RUN would copy it to $DEST_ROOT/incoming/$new_id/, verify size + sha256 vs manifest and a complete pg_restore --list, then publish"
-  local wend wopens wstate
-  pool_state_ok || true
-  wend="$(transfer_window_end)"
-  wopens="$(transfer_window_opens)"
-  if [[ "$wend" != 0 ]]; then
-    wstate="open until $(date -u -d "@$wend" '+%H:%MZ')"
-  elif [[ "$wopens" != 0 ]]; then
-    wstate="opens at $(date -u -d "@$wopens" '+%H:%MZ'): a run would wait for it, then copy"
+  if [[ "$DEST_LOCAL" == "1" ]]; then
+    log "DRY-RUN would move it into $DEST_ROOT/incoming/$new_id/ (one rename on the stage's filesystem, nothing copied), verify size + sha256 vs manifest and a complete pg_restore --list, then publish"
+    log "DRY-RUN publish: local destination $(findmnt -T "$DEST_ROOT" -n -o SOURCE,TARGET,FSTYPE 2>/dev/null | tr -s '[:space:]' ' ')(DEST_LOCAL=1): no pool gate, copy window, pacing or share-copy lock"
   else
-    wstate="closed now: a run would pause without writing"
+    log "DRY-RUN would copy it to $DEST_ROOT/incoming/$new_id/, verify size + sha256 vs manifest and a complete pg_restore --list, then publish"
+    local wend wopens wstate
+    pool_state_ok || true
+    wend="$(transfer_window_end)"
+    wopens="$(transfer_window_opens)"
+    if [[ "$wend" != 0 ]]; then
+      wstate="open until $(date -u -d "@$wend" '+%H:%MZ')"
+    elif [[ "$wopens" != 0 ]]; then
+      wstate="opens at $(date -u -d "@$wopens" '+%H:%MZ'): a run would wait for it, then copy"
+    else
+      wstate="closed now: a run would pause without writing"
+    fi
+    log "DRY-RUN copy plan: --bwlimit=$BWLIMIT_KBPS KiB/s, steps of ${PACE_STEP_SECONDS}s, window ${TRANSFER_DEADLINE_EPOCH:+deadline }${TRANSFER_DEADLINE_EPOCH:-$TRANSFER_WINDOW_UTC UTC} ($wstate), pool state now: $POOL_STATE_LINE"
+    log "DRY-RUN share: $SHARE_COPY_LOCK is held only while a step writes and is released for each pool wait; a backup_pg_db.sh copy waiting on $SHARE_WAIT_LOCK goes first at the next step"
   fi
-  log "DRY-RUN copy plan: --bwlimit=$BWLIMIT_KBPS KiB/s, steps of ${PACE_STEP_SECONDS}s, window ${TRANSFER_DEADLINE_EPOCH:+deadline }${TRANSFER_DEADLINE_EPOCH:-$TRANSFER_WINDOW_UTC UTC} ($wstate), pool state now: $POOL_STATE_LINE"
-  log "DRY-RUN share: $SHARE_COPY_LOCK is held only while a step writes and is released for each pool wait; a backup_pg_db.sh copy waiting on $SHARE_WAIT_LOCK goes first at the next step"
   if [[ -n "$latest" ]]; then
     if [[ "$DRY_RUN_HASH" == "1" ]]; then
       PHASE="verify-published"
@@ -1354,9 +1444,14 @@ show_status() {
   log "mount: $(findmnt -T "$MOUNTPOINT" -n -o SOURCE,TARGET,FSTYPE,OPTIONS | sed 's/[[:space:]]\\+/ /g')"
   log "destination: $DEST_ROOT (available_kb=$(available_kb_of "$DEST_ROOT"))"
   log "local staging: $LOCAL_STAGING (available_kb=$(available_kb_of "$LOCAL_STAGING"))"
-  log "bwlimit_kbps: $BWLIMIT_KBPS (steps of ${PACE_STEP_SECONDS}s, window ${TRANSFER_DEADLINE_EPOCH:-$TRANSFER_WINDOW_UTC UTC}, pool gate ${PACE_GATE})"
-  pool_state_ok || true
-  log "pool state: $POOL_STATE_LINE"
+  if [[ "$DEST_LOCAL" == "1" ]]; then
+    # 3.4.0: nothing goes to a share, so status reads no pool state from one.
+    log "publish: local move (DEST_LOCAL=1): the verified stage is renamed into $DEST_ROOT; no pool gate, copy window, pacing or share-copy lock"
+  else
+    log "bwlimit_kbps: $BWLIMIT_KBPS (steps of ${PACE_STEP_SECONDS}s, window ${TRANSFER_DEADLINE_EPOCH:-$TRANSFER_WINDOW_UTC UTC}, pool gate ${PACE_GATE})"
+    pool_state_ok || true
+    log "pool state: $POOL_STATE_LINE"
+  fi
   log "free space: $(free_space_summary)"
   [[ -s "$PAUSED_FILE" ]] && log "paused copy: $(head -n 2 "$PAUSED_FILE" | tr '\n' ' ')"
   [[ -s "$CRON_AFTER_RUN_FILE" ]] && log "cron schedule to install when the next run ends: $(head -n 1 "$CRON_AFTER_RUN_FILE")"

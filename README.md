@@ -227,6 +227,9 @@ database, with raw `pg_dump` / `pg_restore` / `psql` inside the container and no
 - **Gentle on the NAS.** The copy runs in paced `rsync --append` steps inside a UTC window, waits while a pool-state
   probe on the NAS says BUSY, stops before a free-space floor, and resumes a paused copy the next night. The nightly
   starts early enough that its dump is done when the window opens, and waits for it.
+- **Or a local drive.** With `DEST_LOCAL=1` the backup is published on a local drive beside the stage: the verified
+  dump is moved into place with one rename and verified again there, with no window or pacing. `backup_pg_db.sh`
+  has `MIRROR_COPY=0` to keep its copies off the share too.
 - **Proven restorable.** A weekly test restores the published dump into a throwaway container and compares exact row
   counts with the live database.
 - **Siblings.** `backup_pg_db.sh` covers the smaller databases in the same container (snapshot dump, exact restore

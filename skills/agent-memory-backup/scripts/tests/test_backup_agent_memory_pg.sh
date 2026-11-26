@@ -2,8 +2,9 @@
 # Tests for backup_agent_memory_pg.sh's one-verified-backup policy.
 #
 # Runs on Linux (flock, findmnt, GNU stat) as a non-root user. Everything lives
-# in a temp dir: a fake `docker` serves pg_dump/pg_restore/psql, and an rsync
-# wrapper can corrupt or fail a transfer. No real backup path is touched.
+# in a temp dir: a fake `docker` serves pg_dump/pg_restore/psql, an rsync
+# wrapper can corrupt or fail a transfer, and a fake `mountpoint` stands in for
+# the local drive (3.4.0). No real backup path is touched.
 #   bash scripts/tests/test_backup_agent_memory_pg.sh [path/to/backup_agent_memory_pg.sh]
 set -uo pipefail
 
@@ -45,6 +46,8 @@ if [[ "$cmd" == *"pg_restore --list"* ]]; then
   calls=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
   echo "$calls" > "$count_file"
   [[ "${FAKE_PG_RESTORE_FAIL_CALL:-0}" == "$calls" ]] && { cat >/dev/null; exit 1; }
+  # FAKE_PG_RESTORE_SLEEP_CALL=<n> (3.4.0 tests): call n takes FAKE_PG_RESTORE_SLEEP seconds, so a watchdog can stop it.
+  [[ "${FAKE_PG_RESTORE_SLEEP_CALL:-0}" == "$calls" ]] && sleep "${FAKE_PG_RESTORE_SLEEP:-30}"
   IFS= read -r first || exit 1
   [[ "$first" == "PGDMP" ]] || { echo "pg_restore: not a custom archive" >&2; exit 1; }
   IFS= read -r seed
@@ -110,7 +113,14 @@ if [[ -f "\${FAKE_STATE:-/nonexistent}/df_low" && "\$(cat "\$FAKE_STATE/df_low")
 fi
 exec "$REAL_DF" "\$@"
 SHIM
-chmod +x "$WORK/bin/docker" "$WORK/bin/rsync" "$WORK/bin/df"
+cat > "$WORK/bin/mountpoint" <<'SHIM'
+#!/usr/bin/env bash
+# Fake mountpoint (3.4.0 local destination): a test dir is no mount point, so the test decides. FAKE_STATE/unmounted
+# makes every path "not a mount point"; otherwise every path is one.
+[[ -f "${FAKE_STATE:-/nonexistent}/unmounted" ]] && exit 1
+exit 0
+SHIM
+chmod +x "$WORK/bin/docker" "$WORK/bin/rsync" "$WORK/bin/df" "$WORK/bin/mountpoint"
 
 # pool_state <OK|BUSY> [utc-stamp]: the line the NAS-side probe writes onto the share (3.2.0 gate).
 pool_state() {
@@ -128,7 +138,7 @@ new_env() {
   export STATE_DIR="$E/state" LOG_DIR="$E/logs" LOCK_FILE="$E/backup.lock"
   export MIN_DEST_FREE_KB=0 LOCAL_MIN_FREE_KB=0 CAPACITY_PROBE_DELAY_SECONDS=0
   export MOUNT_RETRY_ATTEMPTS=1 RSYNC_RETRY_ATTEMPTS=1 RSYNC_RETRY_DELAY_SECONDS=0 ALERT_SYSLOG=0
-  unset FAKE_PG_DUMP_FAIL FAKE_PG_RESTORE_FAIL_CALL FAKE_RSYNC_CORRUPT FAKE_RSYNC_FAIL FAKE_LIST_DROP_ENTRY FAKE_RSYNC_EAGAIN_TIMES FAKE_DUMP_LINES TRANSFER_WINDOW_UTC
+  unset FAKE_PG_DUMP_FAIL FAKE_PG_RESTORE_FAIL_CALL FAKE_RSYNC_CORRUPT FAKE_RSYNC_FAIL FAKE_LIST_DROP_ENTRY FAKE_RSYNC_EAGAIN_TIMES FAKE_DUMP_LINES TRANSFER_WINDOW_UTC DEST_LOCAL
   # 3.2.0 pacing: a fresh OK pool state, a deadline a day ahead and fast steps, so the cases above pacing behave
   # as before; the pacing cases (section 20) override these per run.
   export TRANSFER_DEADLINE_EPOCH=$(( $(date +%s) + 86400 )) POOL_STATE_MAX_AGE_SECONDS=100000 PACE_GATE=1
@@ -883,6 +893,150 @@ else
   check "window form: (not checked after 23:50 UTC)" true
 fi
 
+# 25. 3.4.0: DEST_LOCAL=1 publishes on a local drive on the stage's filesystem. The stage's dump is moved into place
+#     with one rename: no rsync of it, no pool gate, no copy window, no pacing and no share-copy lock. Verify, publish
+#     and delete-after-publish are as before; a run that stops before publication moves the dump back into its stage.
+#     Switching from the share leaves everything on the share as it was, a paused partial included (25a).
+new_env 25
+# share_snap <root>: every path, size, mtime and mode under <root>, and every file's sha256
+share_snap() { (cd "$1" && find . -printf '%p %s %T@ %m\n' | sort; find . -type f -print0 | sort -z | xargs -0 -r sha256sum); }
+stage_whole() {
+  local s id; s="$(cat "$STATE_DIR/pending-stage.txt" 2>/dev/null)"; id="$(basename "$s" | cut -d. -f1)"
+  [[ -n "$id" && "$(sha256sum "$s/$id.dump" 2>/dev/null | awk '{print $1}')" == \
+     "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["sha256"])' "$s/$id.manifest.json" 2>/dev/null)" ]]
+}
+SHARE_ROOT="$DEST_ROOT"
+run_job x_share run FAKE_DUMP_SEED=100; OUT="$E/fake/x_share.out"
+check "local switch: a share-mode run first publishes on the share" rc_is 0
+SHARE_ID="$(pointer)"
+run_job x_pause run FAKE_DUMP_SEED=101 FAKE_DUMP_LINES=60000 BWLIMIT_KBPS=40 PACE_STEP_SECONDS=2 TRANSFER_DEADLINE_EPOCH=$(( $(date +%s) + 5 )); OUT="$E/fake/x_pause.out"
+check "local switch: a share-mode copy then pauses with a partial on the share (exit 4)" rc_is 4
+X_ID="$(pending_id)"
+check "local switch: the paused partial is on the share" test "$(inc_size "$X_ID")" -gt 0
+SHARE_BEFORE="$(share_snap "$SHARE_ROOT")"
+# The switch: the destination moves to a local drive beside the stage. Its default pool state file does not exist,
+# and the copy deadline passed long ago, so a copy to a share would pause at once.
+export MOUNTPOINT="$E/local" DEST_ROOT="$E/local/backups/agent-memory-postgres" DEST_LOCAL=1 TRANSFER_DEADLINE_EPOCH=1
+
+# 25a. The first local run resumes the verified pending stage and moves it into place.
+run_job x_first run FAKE_DUMP_SEED=102 FAKE_RSYNC_LOG="$E/fake/rsync_local.log"; OUT="$E/fake/x_first.out"
+check "local: the first local run exits 0 (deadline long past, no pool state file)" rc_is 0
+check "local: it publishes the pending backup" pointer_is "$X_ID"
+check "local: it took no new dump" no_new_dump
+check "local: the paused marker that names the share is discarded as stale" grep -q 'discarding a stale paused-transfer marker' "$OUT"
+check "local: the dump is moved into place" grep -q 'moved the verified dump into' "$OUT"
+check "local: no rsync ran" test ! -s "$E/fake/rsync_local.log"
+check "local: no copy step, pool read, window wait or share-copy lock" bash -c "! grep -qE 'pace step|pool not OK|copy window|share-copy lock' '$OUT'"
+check "local: exactly one published backup on the local drive" exactly_one_published
+check "local: the published dump matches its manifest sha256" published_sha_matches
+check "local: no incoming copy left" no_incoming
+check "local: no stage or pending file left" no_stage
+check "local: no paused marker left" no_paused_file
+check "local: no alert" no_alert
+check "local: latest.json names the local destination" grep -q "\"destination_root\": \"$DEST_ROOT\"" "$STATE_DIR/latest.json"
+check "local: latest.json says local-move" grep -q '"publish": "local-move"' "$STATE_DIR/latest.json"
+check "local: nothing on the share changed, its paused partial included" test "$SHARE_BEFORE" = "$(share_snap "$SHARE_ROOT")"
+check "local: the share's pointer still names its own backup" test "$(tr -d '\n' < "$SHARE_ROOT/latest_backup_id.txt")" = "$SHARE_ID"
+
+# 25b. The next local run takes a fresh dump, publishes it and only then deletes the previous one.
+L1="$(pointer)"
+run_job x_second run FAKE_DUMP_SEED=103; OUT="$E/fake/x_second.out"
+check "local: a fresh local run exits 0" rc_is 0
+check "local: it publishes a new backup" bash -c "[[ '$(pointer)' != '$L1' ]]"
+check "local: exactly one published backup" exactly_one_published
+check "local: the previous one is deleted after the publish (log order)" bash -c "awk '/published verified backup/{p=NR} /deleted superseded backup/{d=NR} END{exit !(p && d && p<d)}' '$OUT'"
+check "local: the published dump matches its sha256" published_sha_matches
+check "local: no stage left" no_stage
+check "local: the share is still unchanged" test "$SHARE_BEFORE" = "$(share_snap "$SHARE_ROOT")"
+
+# 25c. The destination's pg_restore --list fails (call 3: dump list, stage verify, destination verify): nothing is
+#      published, the previous backup is kept, the dump goes back into its stage, and the next run publishes it.
+L2="$(pointer)"
+run_job x_listfail run FAKE_DUMP_SEED=104 FAKE_PG_RESTORE_FAIL_CALL=3; OUT="$E/fake/x_listfail.out"
+check "local verify failure: exits 1" rc_is 1
+check "local verify failure: the previous pointer is unchanged" pointer_is "$L2"
+check "local verify failure: exactly one published backup" exactly_one_published
+check "local verify failure: no incoming copy left" no_incoming
+check "local verify failure: the dump is moved back into its stage" grep -q 'moved the unpublished dump back into its stage' "$OUT"
+check "local verify failure: the stage stays pending and whole" stage_whole
+check "local verify failure: an alert is raised" alert_present
+V_ID="$(pending_id)"
+run_job x_resume run FAKE_DUMP_SEED=105; OUT="$E/fake/x_resume.out"
+check "local resume: exits 0" rc_is 0
+check "local resume: publishes the pending backup" pointer_is "$V_ID"
+check "local resume: no new dump" no_new_dump
+check "local resume: exactly one published backup" exactly_one_published
+check "local resume: the published dump matches its sha256" published_sha_matches
+check "local resume: no stage left" no_stage
+check "local resume: the alert is cleared" no_alert
+
+# 25d. A watchdog TERM while the destination copy is verified: the dump goes back into its stage, the previous backup
+#      is kept, and the next run publishes the stage.
+L3="$(pointer)"
+rm -f "$E/fake/pg_restore_calls"; sleep 1.1
+FAKE_DUMP_SEED=106 FAKE_PG_RESTORE_SLEEP_CALL=3 FAKE_PG_RESTORE_SLEEP=60 timeout -s TERM 20 bash "$SCRIPT" run > "$E/fake/x_term.out" 2>&1; RC=$?; OUT="$E/fake/x_term.out"
+for _ in $(seq 1 150); do pgrep -f "$SCRIPT run-locked" >/dev/null || break; sleep 0.2; done
+check "local TERM: reports the watchdog exit (124)" rc_is 124
+check "local TERM: the TERM came after the move" grep -q 'moved the verified dump into' "$OUT"
+check "local TERM: the dump is moved back into its stage" grep -q 'moved the unpublished dump back into its stage' "$OUT"
+check "local TERM: the previous pointer is unchanged" pointer_is "$L3"
+check "local TERM: exactly one published backup" exactly_one_published
+check "local TERM: no incoming copy left" no_incoming
+check "local TERM: the stage stays pending and whole" stage_whole
+T_ID="$(pending_id)"
+run_job x_after_term run FAKE_DUMP_SEED=107; OUT="$E/fake/x_after_term.out"
+check "local TERM: the next run exits 0" rc_is 0
+check "local TERM: it publishes the stage the TERM left" pointer_is "$T_ID"
+check "local TERM: no new dump" no_new_dump
+check "local TERM: the share is still unchanged" test "$SHARE_BEFORE" = "$(share_snap "$SHARE_ROOT")"
+
+# 25e. An unmounted local drive: its mount point is a plain directory, so the run creates nothing under it and fails.
+new_env 25e
+export MOUNTPOINT="$E/local" DEST_ROOT="$E/local/backups/agent-memory-postgres" DEST_LOCAL=1
+touch "$E/fake/unmounted"
+run_job x_unmounted run FAKE_DUMP_SEED=108; OUT="$E/fake/x_unmounted.out"
+check "unmounted: exits 1" rc_is 1
+check "unmounted: the mount is reported unavailable" grep -q 'media mount remained unavailable' "$OUT"
+check "unmounted: nothing was created under the mount point" test ! -e "$DEST_ROOT"
+check "unmounted: nothing was dumped" no_new_dump
+rm -f "$E/fake/unmounted"
+
+# 25f. Staging on another filesystem than DEST_ROOT: refused before any dump (a rename cannot cross filesystems).
+SHM=""
+[[ -d /dev/shm && -w /dev/shm && "$(stat -c %d /dev/shm)" != "$(stat -c %d "$E")" ]] && SHM="$(mktemp -d /dev/shm/amb-test.XXXXXX)"
+if [[ -n "$SHM" ]]; then
+  run_job x_xdev run FAKE_DUMP_SEED=109 LOCAL_STAGING="$SHM" FREE_CHECK_PATHS="/ $SHM"; OUT="$E/fake/x_xdev.out"
+  check "two filesystems: exits 1" rc_is 1
+  check "two filesystems: the refusal says why" grep -q 'DEST_LOCAL=1 needs DEST_ROOT and LOCAL_STAGING on one filesystem' "$OUT"
+  check "two filesystems: nothing was dumped" no_new_dump
+  rm -rf -- "$SHM"
+else
+  for _ in 1 2 3; do check "two filesystems: (not checked: no second writable filesystem)" true; done
+fi
+run_job x_badmode run DEST_LOCAL=yes; OUT="$E/fake/x_badmode.out"
+check "DEST_LOCAL=yes is refused (exit 1)" rc_is 1
+check "the refusal names DEST_LOCAL" grep -q 'DEST_LOCAL must be 0 or 1' "$OUT"
+
+# 25g. dry-run and status describe the local move, read no pool state and change nothing.
+run_job x_base run FAKE_DUMP_SEED=110; OUT="$E/fake/x_base.out"
+check "local dry-run: setup run exits 0" rc_is 0
+BEFORE="$(tree_snapshot)"
+run_job x_dry dry-run; OUT="$E/fake/x_dry.out"
+AFTER="$(tree_snapshot)"
+check "local dry-run: exits 0" rc_is 0
+check "local dry-run: changes nothing" test "$BEFORE" = "$AFTER"
+check "local dry-run: plans the move" grep -q 'DRY-RUN would move it into' "$OUT"
+check "local dry-run: names the local destination" grep -q 'DRY-RUN publish: local destination' "$OUT"
+check "local dry-run: no copy plan and no pool state" bash -c "! grep -qE 'DRY-RUN copy plan|pool state now' '$OUT'"
+check "local dry-run: verifies the published backup" grep -q 'verify published .*: ok' "$OUT"
+run_job x_status status; OUT="$E/fake/x_status.out"
+check "local status: exits 0" rc_is 0
+check "local status: reads the local destination" grep -q "destination: $DEST_ROOT (" "$OUT"
+check "local status: says the stage is moved into place" grep -q 'publish: local move (DEST_LOCAL=1)' "$OUT"
+check "local status: reads no pool state" bash -c "! grep -q 'pool state:' '$OUT'"
+check "local status: lists the one published backup" grep -q "published backups: 1 ($(pointer) )" "$OUT"
+unset DEST_LOCAL
+
 # 19. Runner: receipts for every run; an alert when the script dies without one.
 RUNNER_SRC="$(dirname "$SCRIPT")/backup_runner.py"
 if [[ -f "$RUNNER_SRC" ]]; then
@@ -938,6 +1092,20 @@ exit "${FAKE_EXIT:-0}"
   : > "$IL"
   runner FAKE_EXIT=0 FAKE_INSTALL_LOG="$IL"
   check "runner: with no file left it installs nothing" test ! -s "$IL"
+  # 3.4.0: the receipt names where the run publishes and how, from the env file beside the runner (as the script reads
+  # it); without any setting it names the script's default share destination and the paced copy.
+  RCPT="$RD/state/reliability-run-exit.public.json"
+  printf '%s\n' "DEST_ROOT=$RD/local-dest" "DEST_LOCAL=1" > "$RD/bin/agent-memory-backup.env"
+  env -u AGENT_MEMORY_BACKUP_ENV -u DEST_ROOT -u MOUNTPOINT -u DEST_LOCAL AGENT_MEMORY_BACKUP_HOME="$RD" STATE_DIR="$RD/state" \
+    LOG_DIR="$RD/logs" ALERT_SYSLOG=0 FAKE_EXIT=0 python3 "$RD/bin/backup_runner.py"; RC=$?; sleep 1.1
+  check "runner: exit 0 with a local destination in the env file" rc_is 0
+  check "runner: the receipt names the env file's destination" grep -q "\"destination_root\": \"$RD/local-dest\"" "$RCPT"
+  check "runner: the receipt says the run publishes by a local move" grep -q '"publish": "local move"' "$RCPT"
+  rm -f "$RD/bin/agent-memory-backup.env"
+  env -u DEST_ROOT -u MOUNTPOINT -u DEST_LOCAL AGENT_MEMORY_BACKUP_ENV="$WORK/empty.env" AGENT_MEMORY_BACKUP_HOME="$RD" \
+    STATE_DIR="$RD/state" LOG_DIR="$RD/logs" ALERT_SYSLOG=0 FAKE_EXIT=0 python3 "$RD/bin/backup_runner.py"; RC=$?; sleep 1.1
+  check "runner: without settings the receipt names the default share destination" grep -q '"destination_root": "/mnt/nas/backups/agent-memory-postgres"' "$RCPT"
+  check "runner: without settings the receipt says paced copy" grep -q '"publish": "paced copy"' "$RCPT"
 fi
 
 echo "# passed $PASS failed $FAIL"

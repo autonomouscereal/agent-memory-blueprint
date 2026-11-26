@@ -13,6 +13,10 @@ followed by the destination verify. After a run that held the lock (any exit but
 runner installs a cron schedule that `install-cron --after-next-run` left in
 state/install-cron-after-run.txt, so a schedule change takes effect after the run that was
 already due, never by moving it.
+
+3.4.0 (2026-11-26): the receipt names where the run publishes (DEST_ROOT, from the same env
+file the script reads) and how ("local move" with DEST_LOCAL=1, else "paced copy"), so a
+check that reads the receipt finds the backup where the job now writes it.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ import subprocess
 import syslog
 import time
 
-RUNNER_VERSION = "3.3.0"
+RUNNER_VERSION = "3.4.0"
 SCRIPT = pathlib.Path(__file__).resolve().with_name("backup_agent_memory_pg.sh")
 ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 
@@ -70,6 +74,9 @@ STATE_DIR = pathlib.Path(setting("STATE_DIR", str(HOME / "state")))
 LOG_FILE = pathlib.Path(setting("LOG_DIR", str(HOME / "logs"))) / "cron.log"
 TIMEOUT_SECONDS = int(setting("BACKUP_TIMEOUT_SECONDS", "36000"))
 CRON_AFTER_RUN = STATE_DIR / "install-cron-after-run.txt"
+# 3.4.0: the script's DEST_ROOT and DEST_LOCAL, by its defaults (DEST_ROOT under MOUNTPOINT, MOUNTPOINT /mnt/nas).
+DEST_ROOT = setting("DEST_ROOT", setting("MOUNTPOINT", "/mnt/nas") + "/backups/agent-memory-postgres")
+PUBLISH = "local move" if setting("DEST_LOCAL", "0") == "1" else "paced copy"
 
 EXIT_MEANINGS = {
     0: "published; exactly one verified backup kept",
@@ -168,6 +175,8 @@ def main() -> int:
         "started_at_utc": started.isoformat(),
         "completed_at_utc": completed.isoformat(),
         "retention": "one-verified",
+        "destination_root": DEST_ROOT,
+        "publish": PUBLISH,
         "bandwidth_kib_s": setting("BWLIMIT_KBPS", "6000"),
         "timeout_seconds": TIMEOUT_SECONDS,
         "cleanup_wait_seconds": cleanup_wait_seconds,
