@@ -280,7 +280,7 @@ run_cmd offrun run MIRROR_COPY=0 PATH="$WORK/bin13:$PATH"
 OFF_ID="$(tr -d '\n' < "$DEST_ROOT/labdb/latest_backup_id.txt")"
 check "NAS copy off: a run exits 0" rc_is 0
 check "NAS copy off: the run publishes a new local backup" bash -c "[[ '$OFF_ID' != '$J' && -s '$DEST_ROOT/labdb/dumps/$OFF_ID.dump' ]]"
-check "NAS copy off: its backup complete line ends in nas=off" grep -q "] backup complete: $DEST_ROOT/labdb/dumps/$OFF_ID.dump size=[0-9]* sha256=[0-9a-f]* nas=off$" "$E/logs/pg.log"
+check "NAS copy off: its backup complete line ends in nas=off" grep -q "] backup complete: $DEST_ROOT/labdb/dumps/$OFF_ID.dump size=[0-9]* sha256=[0-9a-f]* nas=off$" "$OUT"
 check "NAS copy off: the manifest lists only the local copy" grep -qxF "  \"copies\": [\"$DEST_ROOT/labdb/dumps/$OFF_ID.dump\"]" "$DEST_ROOT/labdb/manifests/$OFF_ID.manifest.json"
 check "NAS copy off: the run wrote nothing to the share" test "$MNT_BEFORE" = "$(mnt_snap)"
 check "NAS copy off: no rsync ran in the run" test ! -s "$FAKE_STATE/rsync_args"
@@ -288,7 +288,7 @@ sleep 1.1
 run_cmd onrun run PATH="$WORK/bin13:$PATH"
 ON_ID="$(tr -d '\n' < "$DEST_ROOT/labdb/latest_backup_id.txt")"
 check "NAS copy on (default): a run exits 0" rc_is 0
-check "NAS copy on (default): its backup complete line ends in nas=verified" grep -q "] backup complete: $DEST_ROOT/labdb/dumps/$ON_ID.dump .* nas=verified$" "$E/logs/pg.log"
+check "NAS copy on (default): its backup complete line ends in nas=verified" grep -q "] backup complete: $DEST_ROOT/labdb/dumps/$ON_ID.dump .* nas=verified$" "$OUT"
 check "NAS copy on (default): the dump is verified on the share" on_share "$ON_ID"
 run_cmd offstatus status MIRROR_COPY=0 CRON_DBS=labdb
 check "NAS copy off: status says the NAS copy is off" grep -q 'NAS copy: off (MIRROR_COPY=0)' "$OUT"
